@@ -620,11 +620,17 @@ private extension View {
     /// Real iOS 26 Liquid Glass where available; `.ultraThinMaterial` on iOS 17–25 — a clean
     /// blended degrade so the bar stays modern on new OSes without breaking older ones.
     @ViewBuilder func liquidGlass(in shape: some Shape) -> some View {
+        // `glassEffect` exists only in the iOS 26 SDK (Swift 6.2 / Xcode 26); older Xcode builds
+        // compile the Material fallback alone.
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             self.glassEffect(.regular, in: shape)
         } else {
             self.background(.ultraThinMaterial, in: shape)
         }
+        #else
+        self.background(.ultraThinMaterial, in: shape)
+        #endif
     }
 }
 #endif
