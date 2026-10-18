@@ -38,9 +38,24 @@ public enum StrandMotion {
     /// Ease for the ring/gauge draw-in when a value changes.
     public static let drawIn = Animation.easeOut(duration: durationSlow)
 
+    /// The ring/gauge draw-in, suppressed when Reduce Motion is on. Returns `nil`
+    /// (no animation) when reduced so `withAnimation` sets the fraction instantly and
+    /// the arc/bead snaps to its final frame instead of sweeping. Mirrors
+    /// `breathe(reduced:)` and honours Apple's Reduce Motion HIG.
+    public static func drawIn(reduced: Bool) -> Animation? {
+        reduced ? nil : drawIn
+    }
+
     /// Looping breathe animation for ambient glow/pulse.
     public static var breathe: Animation {
         .easeInOut(duration: breathPeriod).repeatForever(autoreverses: true)
+    }
+
+    /// Looping breathe animation, suppressed when Reduce Motion is on. Returns
+    /// `nil` (no animation) when reduced so call sites collapse to the resting
+    /// frame instead of an indefinite loop. Honours Apple's Reduce Motion HIG.
+    public static func breathe(reduced: Bool) -> Animation? {
+        reduced ? nil : breathe
     }
 
     /// A single heartbeat ripple pulse.

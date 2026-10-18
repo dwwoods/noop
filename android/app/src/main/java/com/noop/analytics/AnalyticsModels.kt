@@ -40,6 +40,18 @@ data class UserProfile(
     val age: Double = 30.0,
     /** "male" | "female" | "nonbinary". */
     val sex: String = "nonbinary",
+    /**
+     * Counter ticks per real step for the @57 motion counter (#139). The WHOOP 5/MG
+     * counter overcounts and its true tick rate is unknown, so the daily-steps total
+     * divides by this. 1.0 = raw pass-through (default); the engine clamps ≥ 0.5.
+     */
+    val stepTicksPerStep: Double = 1.0,
+    /**
+     * Waist circumference (cm) for the Fitness Age VO₂max estimate (Phase 2). 0 = not set.
+     * Optional — it UNLOCKS the VO₂max readout but does NOT sharpen the headline Fitness Age
+     * (the body term cancels out of the age formula). Default param so existing call-sites compile.
+     */
+    val waistCm: Double = 0.0,
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +231,7 @@ data class ProfileBaselines(
     val hrv: BaselineState? = null,
     val restingHR: BaselineState? = null,
     val resp: BaselineState? = null,
+    val skinTemp: BaselineState? = null,
 )
 
 /**
@@ -236,8 +249,44 @@ data class DayResult(
     val sleepSessions: List<DetectedSleep>,
     /** Detected workout/exercise sessions. */
     val workouts: List<ExerciseSession>,
-    /** Recovery score [0,100] or null (cold-start / no HRV baseline). */
+    /** Charge (recovery) score [0,100] or null (cold-start / no HRV baseline). */
     val recovery: Double?,
-    /** Day strain [0,21] or null (insufficient HR samples / invalid HRR). */
+    /** Effort (strain) score [0,100] or null (insufficient HR samples / invalid HRR). */
     val strain: Double?,
+    /**
+     * Rest (sleep_performance) composite [0,100] or null (no in-bed session). The persistence /
+     * series layer stores this under the `sleep_performance` key. Replaces the bare efficiency
+     * proxy (duration-vs-need 0.50 + efficiency 0.20 + restorative 0.20 + consistency 0.10).
+     */
+    val rest: Double? = null,
+    /**
+     * Wear-gated mean in-bed skin temperature (°C) for this night, or null when no worn in-bed
+     * samples were available. Baseline-INDEPENDENT (like avgHrv): the caller seeds a personal
+     * skin-temp baseline from these nightly means and re-derives [com.noop.data.DailyMetric.skinTempDevC]
+     * in a second pass. APPROXIMATE. (PR #85)
+     */
+    val nightlySkinTempC: Double? = null,
+    /** Per-score certainty tier for Charge (recovery). Mirrors Swift. */
+    val chargeConfidence: ScoreConfidence = ScoreConfidence.CALIBRATING,
+    /** Per-score certainty tier for Effort (strain). Mirrors Swift. */
+    val effortConfidence: ScoreConfidence = ScoreConfidence.CALIBRATING,
+    /** Per-score certainty tier for Rest (sleep_performance composite). Mirrors Swift. */
+    val restConfidence: ScoreConfidence = ScoreConfidence.CALIBRATING,
+    /**
+     * Per-session per-epoch MOTION magnitudes (H8), keyed by each matched session's detected start
+     * ([DetectedSleep.start]), on the same 30 s epoch grid as that session's `stagesJSON`. The caller
+     * persists these via `WhoopRepository.persistSessionMotion` after upserting the sleep-session rows. A
+     * session with too little gravity to grid is OMITTED (no key), so the caller never persists a fabricated
+     * zero series. Mirrors Swift `DayResult.sessionMotionByStart`. (H8)
+     */
+    val sessionMotionByStart: Map<Long, List<Double>> = emptyMap(),
+    /**
+     * Per-session per-epoch BAND sleep_state (#175), keyed by each matched session's detected start, on the
+     * same 30 s grid as `stagesJSON` / [sessionMotionByStart]. The strap's OWN @81 code (0 wake/1 still/2
+     * asleep/3 up) gridded per session, for the caller to persist via `WhoopRepository.persistSessionSleepState`.
+     * A session with no band-state samples is OMITTED (no key), so the caller persists NULL there rather than a
+     * fabricated array. Feeds the H7 re-onset CONFIRM guard on the NEXT pass; never overrides the derived
+     * hypnogram. Empty on a WHOOP 4.0. Mirrors Swift `DayResult.sessionSleepStateByStart`. (#175)
+     */
+    val sessionSleepStateByStart: Map<Long, List<Int>> = emptyMap(),
 )

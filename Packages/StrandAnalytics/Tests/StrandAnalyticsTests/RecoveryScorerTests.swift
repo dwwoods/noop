@@ -79,6 +79,79 @@ final class RecoveryScorerTests: XCTestCase {
         XCTAssertEqual(withResp, withoutResp, accuracy: 1e-6)
     }
 
+    func testRespAboveBaselineLowersAndBelowRaisesRecovery() {
+        // Pins the resp-into-recovery wiring direction (mirrors the Android BaselineSeedingTest
+        // addition): with HRV/RHR pinned at baseline, a nightly respiratory rate above the resp
+        // baseline must LOWER recovery and one below it must RAISE it. A nil resp renormalizes
+        // to the no-resp score (testRespTermDropAndRenormalize already pins that).
+        func score(_ resp: Double?) -> Double {
+            RecoveryScorer.recovery(
+                hrv: 50, rhr: 55, resp: resp,
+                hrvBaseline: baseline(mean: 50, sigma: 6),
+                rhrBaseline: baseline(mean: 55, sigma: 3),
+                respBaseline: baseline(mean: 14.5, sigma: 1),
+                sleepPerf: 0.9)!
+        }
+        let neutral = score(nil)
+        let elevated = score(17.5)
+        let lowered = score(12.0)
+        XCTAssertLessThan(elevated, neutral, "resp above baseline must lower recovery")
+        XCTAssertGreaterThan(lowered, neutral, "resp below baseline must raise recovery")
+    }
+
+    func testSkinTempNilLeavesScoreIdenticalToBefore() {
+        // The no-skin-temp path must be byte-identical to the pre-redesign score:
+        // when skinTempDev is nil the term drops and the weights renormalize.
+        func score(_ dev: Double?) -> Double {
+            RecoveryScorer.recovery(
+                hrv: 55, rhr: 52, resp: nil,
+                hrvBaseline: baseline(mean: 50, sigma: 6),
+                rhrBaseline: baseline(mean: 55, sigma: 3),
+                respBaseline: nil,
+                sleepPerf: 0.9,
+                skinTempDev: dev)!
+        }
+        // Default argument (nil) and explicit nil agree, and both equal the no-skin-temp score.
+        let implicitNil = RecoveryScorer.recovery(
+            hrv: 55, rhr: 52, resp: nil,
+            hrvBaseline: baseline(mean: 50, sigma: 6),
+            rhrBaseline: baseline(mean: 55, sigma: 3),
+            respBaseline: nil,
+            sleepPerf: 0.9)!
+        XCTAssertEqual(score(nil), implicitNil, accuracy: 1e-9)
+    }
+
+    func testSkinTempDeviationLowersChargeSymmetrically() {
+        // A symmetric penalty: ANY drift from baseline (hot OR cold) lowers Charge, and a
+        // larger |deviation| lowers it more. Baseline drivers are pinned ABOVE-center
+        // (positive composite z) so the penalty has a visible direction to push against.
+        func score(_ dev: Double?) -> Double {
+            RecoveryScorer.recovery(
+                hrv: 55, rhr: 52, resp: nil,
+                hrvBaseline: baseline(mean: 50, sigma: 6),
+                rhrBaseline: baseline(mean: 55, sigma: 3),
+                respBaseline: nil,
+                sleepPerf: 0.9,
+                skinTempDev: dev)!
+        }
+        let neutral = score(nil)
+        let zeroDev = score(0.0)
+        let warm = score(1.0)
+        let cold = score(-1.0)
+        let bigWarm = score(2.0)
+        // A present zero-deviation term adds no penalty itself, but participates in the
+        // renormalization (extra weight at z=0), so an above-center composite is pulled
+        // slightly toward the logistic center — strictly below the no-term score.
+        XCTAssertLessThan(zeroDev, neutral)
+        // A real deviation penalizes further, below the zero-deviation case…
+        XCTAssertLessThan(warm, zeroDev, "warm deviation must lower Charge")
+        XCTAssertLessThan(cold, zeroDev, "cold deviation must lower Charge")
+        // …symmetrically (±1 °C cost the same)…
+        XCTAssertEqual(warm, cold, accuracy: 1e-9)
+        // …and a larger deviation lowers it more.
+        XCTAssertLessThan(bigWarm, warm)
+    }
+
     func testBandThresholds() {
         XCTAssertEqual(RecoveryScorer.band(20), "red")
         XCTAssertEqual(RecoveryScorer.band(33.9), "red")
@@ -101,5 +174,52 @@ final class RecoveryScorerTests: XCTestCase {
 
     func testRestingHRNilWhenNoSamples() {
         XCTAssertNil(RecoveryScorer.restingHR([], start: 0, end: 1000))
+    }
+
+    // MARK: - #686: artifact hardening of the resting-HR floor
+
+    func testRestingHRRejectsSingleSampleArtifactBin() {
+        // A dense, well-populated bin at 55 bpm, then a SECOND 5-min bin holding exactly ONE
+        // artifact beat at 30 bpm. The old min-of-bin-means took the lone-sample bin (30) as the
+        // floor; with #686 a single-sample bin can't WIN, so the floor is the real 55.
+        var hr: [HRSample] = []
+        let start = 1000
+        for i in 0..<300 { hr.append(HRSample(ts: start + i, bpm: 55)) }   // bin 0: 300 samples @55
+        hr.append(HRSample(ts: start + 300, bpm: 30))                       // bin 1: ONE sample @30
+        let r = RecoveryScorer.restingHR(hr, start: start, end: start + 600)
+        XCTAssertEqual(r, 55, "a single-sample artifact bin must not win the resting floor")
+    }
+
+    func testRestingHRRejectsSubPhysiologicalDropoutBin() {
+        // Two FULLY-populated bins: a real 52 bpm bin and a dropout bin whose 300 samples all read
+        // an implausible 10 bpm (decode-zero / dropout run). It clears the sample-count bar but is
+        // sub-physiological, so #686 bars it from the floor → resting reads the real 52.
+        var hr: [HRSample] = []
+        let start = 2000
+        for i in 0..<300 { hr.append(HRSample(ts: start + i, bpm: 52)) }         // real bin
+        for i in 0..<300 { hr.append(HRSample(ts: start + 300 + i, bpm: 10)) }   // dropout bin
+        let r = RecoveryScorer.restingHR(hr, start: start, end: start + 600)
+        XCTAssertEqual(r, 52, "a sub-physiological dropout bin must not win the resting floor")
+    }
+
+    func testRestingHRKeepsGenuineLowFloor() {
+        // A REAL sustained dip (a full 5-min bin at 45 bpm) is plausible AND well-populated, so it
+        // still wins — the hardening must not flatten genuine athletic resting HRs.
+        var hr: [HRSample] = []
+        let start = 3000
+        for i in 0..<300 { hr.append(HRSample(ts: start + i, bpm: 60)) }
+        for i in 0..<300 { hr.append(HRSample(ts: start + 300 + i, bpm: 45)) }
+        let r = RecoveryScorer.restingHR(hr, start: start, end: start + 600)
+        XCTAssertEqual(r, 45, "a genuine sustained low bin must still win the floor")
+    }
+
+    func testRestingHRFallsBackWhenNoBinQualifies() {
+        // A wholly sparse window: every bin holds a single sample (none clears the count bar).
+        // Rather than return nil on data present, fall back to the legacy lowest-bin-mean (here 48).
+        let start = 4000
+        let hr = [HRSample(ts: start + 10, bpm: 58),
+                  HRSample(ts: start + 320, bpm: 48)]   // two bins, one sample each
+        let r = RecoveryScorer.restingHR(hr, start: start, end: start + 600)
+        XCTAssertEqual(r, 48, "with no qualifying bin, fall back to the lowest bin mean (never nil on data)")
     }
 }

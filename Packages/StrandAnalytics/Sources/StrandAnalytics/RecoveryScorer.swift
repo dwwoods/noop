@@ -9,11 +9,19 @@ import WhoopProtocol
 // WHOOP-identical (WHOOP's model is proprietary). It is a transparent,
 // HRV-dominant, baseline-normalized proxy.
 //
-// Weighting (documented, grounded, explainable):
-//   higher HRV vs baseline       → higher recovery  (W_HRV   = 0.60, dominant)
-//   lower resting HR vs baseline → higher recovery  (W_RHR   = 0.20)
-//   lower resp vs baseline       → higher recovery  (W_RESP  = 0.05)
-//   higher sleep performance     → higher recovery  (W_SLEEP = 0.15)
+// Weighting (documented, grounded, explainable; this is "Charge" in the UI):
+//   higher HRV vs baseline       → higher recovery  (W_HRV       = 0.55, dominant)
+//   lower resting HR vs baseline → higher recovery  (W_RHR       = 0.20)
+//   higher rest quality (sleep)  → higher recovery  (W_SLEEP     = 0.15)
+//   lower resp vs baseline       → higher recovery  (W_RESP      = 0.05)
+//   skin-temp deviation from 0   → lower recovery   (W_SKIN_TEMP = 0.05)
+//
+// The Charge/Effort/Rest redesign folds skin temperature in (illness/overreach
+// signal): HRV dropped 0.60 → 0.55 to make room for W_SKIN_TEMP = 0.05. The
+// skin-temp term is a SYMMETRIC penalty on the ±°C deviation (−|dev|/scale), so any
+// drift away from the personal baseline — hot or cold — lowers Charge. It is added
+// ONLY when a skin-temp deviation is supplied; when nil the term drops and the
+// weights renormalize, leaving the no-skin-temp score IDENTICAL to before.
 //
 // Each metric is standardized to a robust z-score against the personal baseline
 // (mean + EWMA-abs-dev spread). Missing terms are dropped and the weights
@@ -28,10 +36,17 @@ public enum RecoveryScorer {
 
     // MARK: - Constants (recovery.py)
 
-    public static let wHRV: Double = 0.60
+    public static let wHRV: Double = 0.55
     public static let wRHR: Double = 0.20
     public static let wResp: Double = 0.05
     public static let wSleep: Double = 0.15
+    /// Skin-temperature deviation weight (Charge/Effort/Rest redesign). HRV gave up
+    /// 0.05 (0.60 → 0.55) to fund it.
+    public static let wSkinTemp: Double = 0.05
+
+    /// Skin-temp penalty scale (°C): a 1 °C deviation from baseline costs ≈1 z-unit of
+    /// penalty before weighting. Symmetric — sign of the deviation does not matter.
+    public static let skinTempScaleC: Double = 1.0
 
     /// Logistic spread: ±2 z-units ≈ full Red–Green band (15%–95%).
     public static let logisticK: Double = 1.6
@@ -52,6 +67,24 @@ public enum RecoveryScorer {
     /// Rolling-mean HR window (seconds) for the resting-HR estimate.
     public static let restingHRWindowS: Int = 5 * 60
 
+    /// Minimum HR samples a 5-min bin must hold before its mean is eligible to WIN the resting
+    /// floor (#686). A thinly-populated bin — at the limit a single lone beat — lets one artifact
+    /// (a dropout, a decode glitch) become the bin "mean" and win the night's minimum, dragging
+    /// resting HR implausibly low. Requiring a handful of samples means the floor is a genuine
+    /// sustained dip, not a one-sample fluke. Worn nights stream ~1 Hz HR so a real 5-min bin holds
+    /// hundreds of samples and clears this trivially; only sparse/edge bins (a partial trailing bin,
+    /// a gap-straddling bin) fall below it. Does NOT change the floor DEFINITION — still the min of
+    /// 5-min bin means — it only stops an under-sampled artifact bin from being that min.
+    public static let restingHRMinBinSamples: Int = 5
+
+    /// Physiological resting-HR floor (bpm) below which a bin mean is rejected as a dropout artifact
+    /// (#686), never the resting floor. An adult's true sleeping resting HR essentially never sits
+    /// below this; a 5-min mean that does is a run of dropout/decode-zero beats, not a real cardiac
+    /// dip. 25 bpm clears even deeply-bradycardic trained athletes (resting HRs in the low 30s) with
+    /// margin while rejecting the implausible artifact range. A bin below this is excluded from floor
+    /// candidacy; if it were allowed to win, resting HR would read a fabricated sub-physiological value.
+    public static let restingHRMinPlausibleBpm: Double = 25.0
+
     // MARK: - Resting HR
 
     /// Lowest sustained HR during the in-bed window (bpm, rounded), or nil.
@@ -59,21 +92,39 @@ public enum RecoveryScorer {
     /// "Sustained" = the minimum of 5-minute non-overlapping bin means of the HR
     /// samples whose ts ∈ [start, end]. Rejects single-beat dips while capturing
     /// the night's true floor. Returns nil when there are no HR samples in window.
+    ///
+    /// Artifact hardening (#686): a bin may only WIN the floor when it is BOTH well-populated
+    /// (≥ `restingHRMinBinSamples`, so one lone artifact beat can't be a bin "mean") AND
+    /// physiologically plausible (mean ≥ `restingHRMinPlausibleBpm`, rejecting dropout-driven
+    /// sub-physiological dips). The floor DEFINITION is unchanged — still the minimum of the
+    /// 5-min bin means — only artifact bins are barred from being that minimum. If no bin
+    /// qualifies (a wholly sparse/degenerate window), fall back to the lowest of ALL bin means,
+    /// else the all-sample mean, preserving the never-nil-on-data behaviour.
     public static func restingHR(_ hr: [HRSample], start: Int, end: Int) -> Int? {
         let seg = hr.filter { $0.ts >= start && $0.ts <= end }
         guard !seg.isEmpty else { return nil }
 
-        var means: [Double] = []
+        var means: [Double] = []          // every bin mean (legacy floor, the fallback)
+        var qualified: [Double] = []       // bins eligible to WIN the floor (#686)
         var t = start
         while t < end {
             let win = seg.filter { $0.ts >= t && $0.ts < t + restingHRWindowS }
             if !win.isEmpty {
-                means.append(Double(win.reduce(0) { $0 + $1.bpm }) / Double(win.count))
+                let mean = Double(win.reduce(0) { $0 + $1.bpm }) / Double(win.count)
+                means.append(mean)
+                // A bin wins the floor only if it is well-populated AND physiologically plausible —
+                // a thin (single-artifact) or sub-physiological (dropout) bin can't be the minimum.
+                if win.count >= restingHRMinBinSamples && mean >= restingHRMinPlausibleBpm {
+                    qualified.append(mean)
+                }
             }
             t += restingHRWindowS
         }
         let floor: Double
-        if let m = means.min() {
+        if let m = qualified.min() {
+            floor = m
+        } else if let m = means.min() {
+            // No bin cleared the artifact bar (sparse window): fall back to the legacy floor.
             floor = m
         } else {
             floor = Double(seg.reduce(0) { $0 + $1.bpm }) / Double(seg.count)
@@ -88,6 +139,29 @@ public enum RecoveryScorer {
         if score < bandRedMax { return "red" }
         if score < bandYellowMax { return "yellow" }
         return "green"
+    }
+
+    // MARK: - Cold-start calibration progress
+
+    /// Nights carrying a usable nightly HRV — the signal that seeds the recovery baseline. While
+    /// recovery is still nil and this count is in [1, seed), it is the honest
+    /// "Calibrating — N of <seed> nights" progress the dashboard shows in place of a bare empty
+    /// state; nil once recovery exists or no night has data yet. Matches the baseline's validity
+    /// predicate, not just non-nil: `Baselines.update` only advances the recovery seed (nValid)
+    /// for nights whose value is within the metric config bounds, so an implausible out-of-range
+    /// night must NOT be counted here either — else the displayed N could over-state nValid.
+    /// Never claims "calibrating" at/above the seed gate (a nil recovery there is some other gap).
+    /// Mirrors Android TodayScreen.recoveryCalibrationNights (RecoveryCalibrationTest is the oracle).
+    public static func calibrationNights(nightlyHrv: [Double?],
+                                         hasRecovery: Bool,
+                                         seed: Int = Baselines.minNightsSeed,
+                                         cfg: MetricCfg = Baselines.hrvCfg) -> Int? {
+        guard !hasRecovery else { return nil }
+        let n = nightlyHrv.compactMap { $0 }.filter { $0 >= cfg.minVal && $0 <= cfg.maxVal }.count
+        // Include 0: a brand-new user (no banked nights yet) should read "Calibrating — 0 of N" on the
+        // Charge ring, not a bare "No data" that looks broken (#335). Past days are gated to nil by the
+        // caller; >= seed (recovery should exist) still returns nil.
+        return (0..<seed).contains(n) ? n : nil
     }
 
     // MARK: - Recovery score
@@ -123,7 +197,12 @@ public enum RecoveryScorer {
     ///   - hrvBaseline: HRV baseline (required for a score).
     ///   - rhrBaseline: resting-HR baseline; nil drops the RHR term.
     ///   - respBaseline: respiration baseline; nil drops the resp term.
-    ///   - sleepPerf: sleep-performance proxy (efficiency 0..1); nil drops the term.
+    ///   - sleepPerf: Rest quality (Rest composite ÷100, 0..1; was raw efficiency);
+    ///     nil drops the term.
+    ///   - skinTempDev: skin-temperature deviation from the personal baseline (±°C,
+    ///     `DailyMetric.skinTempDevC`). Entered as a SYMMETRIC penalty −|dev|/scale,
+    ///     weight wSkinTemp. nil drops the term and the weights renormalize so the
+    ///     no-skin-temp score is identical to before.
     ///   - hrvBaselineUsable: whether the HRV baseline has enough nights
     ///     (BaselineState.usable). When false, returns nil (cold-start).
     public static func recovery(hrv: Double,
@@ -133,6 +212,7 @@ public enum RecoveryScorer {
                                 rhrBaseline: DriverBaseline?,
                                 respBaseline: DriverBaseline?,
                                 sleepPerf: Double?,
+                                skinTempDev: Double? = nil,
                                 hrvBaselineUsable: Bool = true) -> Double? {
         // Cold-start gate: HRV is the dominant driver; if its baseline isn't
         // usable, refuse to score (more honest than a fabricated value).
@@ -152,9 +232,14 @@ public enum RecoveryScorer {
         if let r = resp, let b = respBaseline {
             terms.append((zScore(b.mean, mean: r, spread: b.spread), wResp))
         }
-        // Sleep-performance term: no baseline needed; centered at SLEEP_PERF_CENTER.
+        // Sleep-performance / Rest-quality term: no baseline needed; centered at SLEEP_PERF_CENTER.
         if let sp = sleepPerf {
             terms.append(((sp - sleepPerfCenter) / sleepPerfScale, wSleep))
+        }
+        // Skin-temp term: SYMMETRIC penalty on |deviation| (illness/overreach). Any
+        // drift from the personal baseline lowers Charge; added only when supplied.
+        if let dev = skinTempDev {
+            terms.append((-abs(dev) / skinTempScaleC, wSkinTemp))
         }
 
         guard !terms.isEmpty else { return nil }
@@ -174,7 +259,8 @@ public enum RecoveryScorer {
                                 hrvBaseline: BaselineState,
                                 rhrBaseline: BaselineState?,
                                 respBaseline: BaselineState?,
-                                sleepPerf: Double?) -> Double? {
+                                sleepPerf: Double?,
+                                skinTempDev: Double? = nil) -> Double? {
         recovery(hrv: hrv,
                  rhr: rhr,
                  resp: resp,
@@ -182,6 +268,7 @@ public enum RecoveryScorer {
                  rhrBaseline: rhrBaseline.map(DriverBaseline.init),
                  respBaseline: respBaseline.map(DriverBaseline.init),
                  sleepPerf: sleepPerf,
+                 skinTempDev: skinTempDev,
                  hrvBaselineUsable: hrvBaseline.usable)
     }
 }

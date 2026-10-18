@@ -6,16 +6,22 @@ import StrandImport
 /// (dailyMetric + sleepSession), so importing lights up the full history immediately.
 enum WhoopImporter {
 
+    /// The WHOOP CSV mapping revision, stamped into the Import test-mode parser line. Bump when this
+    /// importer's column->store mapping changes so a shared report's parser version is unambiguous.
+    static let importerVersion = 1
+
     @discardableResult
-    static func importExport(url: URL, into store: WhoopStore, deviceId: String) async throws -> ImportSummary {
+    static func importExport(url: URL, into store: WhoopStore, deviceId: String,
+                             trace: (@Sendable ([String]) -> Void)? = nil) async throws -> ImportSummary {
         let result = try ImportCoordinator().importWhoopExport(from: url)
 
         // physiological_cycles → DailyMetric (one row per sleep-to-sleep day)
         var metrics: [DailyMetric] = []
         for c in result.cycles {
-            guard let start = c.cycleStart else { continue }
+            guard let day = cycleDay(wake: c.wakeOnset, end: c.cycleEnd, start: c.cycleStart,
+                                     tzOffsetMin: c.tzOffsetMin) else { continue }
             metrics.append(DailyMetric(
-                day: dayString(start, tzOffsetMin: c.tzOffsetMin),
+                day: day,
                 totalSleepMin: c.asleepDurationMin,
                 efficiency: c.sleepEfficiencyPct,
                 deepMin: c.deepSleepDurationMin,
@@ -25,7 +31,8 @@ enum WhoopImporter {
                 restingHr: c.restingHeartRate.map { Int($0.rounded()) },
                 avgHrv: c.hrvMs,
                 recovery: c.recoveryScore,
-                strain: c.dayStrain,
+                // WHOOP Day Strain (0–21) → NOOP's 0–100 Effort axis at the store boundary.
+                strain: WhoopExportImporter.effortFromImportedDayStrain(c.dayStrain),
                 exerciseCount: nil,
                 spo2Pct: c.bloodOxygenPct,
                 skinTempDevC: c.skinTempCelsius,   // NOTE: Whoop export gives absolute °C, not a baseline deviation
@@ -51,8 +58,11 @@ enum WhoopImporter {
                 restingHr: nil, avgHrv: nil, stagesJSON: json))
         }
 
-        try await store.upsertDailyMetrics(metrics, deviceId: deviceId)
-        try await store.upsertSleepSessions(sessions, deviceId: deviceId)
+        // Capture the rows the store ACTUALLY wrote (summed SQLite changes) so the Import test mode can
+        // report mapped-vs-persisted per stage. Capturing the existing return value changes nothing about
+        // what is saved; the calls, their order and their effect are identical with the trace on or off.
+        let metricsWritten = try await store.upsertDailyMetrics(metrics, deviceId: deviceId)
+        let sessionsWritten = try await store.upsertSleepSessions(sessions, deviceId: deviceId)
 
         // Generic metric series — every cycle field, keyed, for the explorer + correlations.
         var points: [MetricPoint] = []
@@ -60,9 +70,9 @@ enum WhoopImporter {
             if let v { points.append(MetricPoint(day: day, key: key, value: v)) }
         }
         for c in result.cycles {
-            guard let start = c.cycleStart else { continue }
-            let day = dayString(start, tzOffsetMin: c.tzOffsetMin)
-            add(day, "recovery", c.recoveryScore);        add(day, "strain", c.dayStrain)
+            guard let day = cycleDay(wake: c.wakeOnset, end: c.cycleEnd, start: c.cycleStart,
+                                     tzOffsetMin: c.tzOffsetMin) else { continue }
+            add(day, "recovery", c.recoveryScore);        add(day, "strain", WhoopExportImporter.effortFromImportedDayStrain(c.dayStrain))
             add(day, "rhr", c.restingHeartRate);          add(day, "hrv", c.hrvMs)
             add(day, "spo2", c.bloodOxygenPct);           add(day, "skin_temp", c.skinTempCelsius)
             add(day, "resp_rate", c.respiratoryRate);     add(day, "energy_kcal", c.energyKcal)
@@ -93,9 +103,11 @@ enum WhoopImporter {
         let (rm, rs) = meanStd(result.cycles.compactMap(\.restingHeartRate))
         let (hm, hs) = meanStd(result.cycles.compactMap(\.hrvMs))
         for c in result.cycles {
-            guard let start = c.cycleStart, let rhr = c.restingHeartRate, let hrv = c.hrvMs else { continue }
+            guard let rhr = c.restingHeartRate, let hrv = c.hrvMs,
+                  let day = cycleDay(wake: c.wakeOnset, end: c.cycleEnd, start: c.cycleStart,
+                                     tzOffsetMin: c.tzOffsetMin) else { continue }
             let z = 0.6 * ((rhr - rm) / rs) - 0.6 * ((hrv - hm) / hs)
-            add(dayString(start, tzOffsetMin: c.tzOffsetMin), "stress", max(0, min(3, 1.5 + z)))
+            add(day, "stress", max(0, min(3, 1.5 + z)))
         }
         // Derived: daily HR-zone minutes + strength-activity time from workouts.
         var zoneByDay: [String: [Double]] = [:]
@@ -123,6 +135,9 @@ enum WhoopImporter {
 
         // Journal behaviours → correlation insights.
         let journal: [JournalEntry] = result.journal.compactMap { j in
+            // journal_entries.csv carries only cycle_start (the onset evening), no wake time, so entries
+            // stay keyed to the onset day rather than the wake day the cycle metrics now use. A minor
+            // correlation-only offset; aligning it needs the parser to thread each cycle's wake day.
             guard let start = j.cycleStart, let q = j.question else { return nil }
             return JournalEntry(day: dayString(start, tzOffsetMin: j.tzOffsetMin),
                                 question: q,
@@ -143,12 +158,50 @@ enum WhoopImporter {
                               durationS: e.timeIntervalSince(s), energyKcal: w.energyKcal,
                               avgHr: w.avgHeartRate.map { Int($0.rounded()) },
                               maxHr: w.maxHeartRate.map { Int($0.rounded()) },
-                              strain: w.activityStrain, distanceM: w.distanceMeters,
+                              strain: WhoopExportImporter.effortFromImportedDayStrain(w.activityStrain), distanceM: w.distanceMeters,
                               zonesJSON: zjson, notes: nil)
         }
-        try await store.upsertWorkouts(workouts, deviceId: deviceId)
+        let workoutsWritten = try await store.upsertWorkouts(workouts, deviceId: deviceId)
+
+        // Import & Data Ingest test mode (Test Centre): emit the per-stage / reject / day-delta trace iff
+        // the mode is on. The caller passes a non-nil `trace` ONLY when TestCentre.active(.dataImport), so
+        // nothing here runs when the mode is off (zero cost). The numbers are the SAME ones the import just
+        // produced (parsed counts + the rows the store reported writing), so emitting them changes nothing
+        // about what was saved. No raw cell value or file name is in any of these lines.
+        if let trace {
+            let c = result.summary.countsByCategory
+            // Per-stage rowsIn is the rows actually HANDED to the store (after the app's mapping drops), so
+            // rowsOut < rowsIn isolates the STORE-write delta - the day-owner-collision / "didn't save" tell
+            // (#601 / #749) - rather than conflating it with the parser/map drop, which the reject line owns.
+            // dailyMetric is keyed by (deviceId, day), so metrics.count == the mapped distinct days.
+            let daysMapped = Set(metrics.map { $0.day }).count
+            // Rows the PARSER produced but the app map then dropped (a cycle with no cycleStart, a non-nap
+            // sleep with no onset/wake, a workout with no start/end): the genuine ingest reject count.
+            let parsedCycles = c["cycles"] ?? 0
+            let parsedSleeps = c["sleeps"] ?? 0
+            let parsedWorkouts = c["workouts"] ?? 0
+            let droppedInMap = max(0, parsedCycles - metrics.count)
+                + max(0, parsedSleeps - sessions.count)
+                + max(0, parsedWorkouts - workouts.count)
+            let lines: [String] = [
+                ImportTrace.parserVersionLine(sourceKind: .whoopExport, importerVersion: importerVersion),
+                ImportTrace.stageLine(category: "cycles", rowsIn: metrics.count, rowsOut: metricsWritten),
+                ImportTrace.stageLine(category: "sleeps", rowsIn: sessions.count, rowsOut: sessionsWritten),
+                ImportTrace.stageLine(category: "workouts", rowsIn: workouts.count, rowsOut: workoutsWritten),
+                ImportTrace.rejectLine(droppedRows: droppedInMap, skippedSpans: result.summary.skippedSpans),
+                ImportTrace.dayDeltaLine(category: "cycles", daysMapped: daysMapped, daysPersisted: metricsWritten),
+            ]
+            trace(lines)
+        }
 
         return result.summary
+    }
+
+    /// The NOOP day a WHOOP cycle belongs to: the local calendar day you WOKE. See
+    /// `WhoopDayKeying.wakeDayKey` for the full rationale (WHOOP exports are onset-to-onset, so a
+    /// cycle's start is the evening before; keying off it blanked Today for import-only users, v8.2.1).
+    private static func cycleDay(wake: Date?, end: Date?, start: Date?, tzOffsetMin: Int) -> String? {
+        WhoopDayKeying.wakeDayKey(wake: wake, end: end, start: start, tzOffsetMin: tzOffsetMin)
     }
 
     /// Local-calendar day string for the cycle's own UTC offset.

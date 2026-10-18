@@ -52,6 +52,25 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         XCTAssertNil(rows[0].notes)
     }
 
+    func testDeleteJournalTouchesOnlyTheNamedSource() async throws {
+        // The native logging card clears under "noop-journal" only, an identical
+        // (day, question) imported under "my-whoop" must survive the clear.
+        let store = try await WhoopStore.inMemory()
+        let e = JournalEntry(day: "2026-06-09", question: "Any alcohol?", answeredYes: true, notes: nil)
+        try await store.upsertJournal([e], deviceId: "my-whoop")
+        try await store.upsertJournal([e], deviceId: "noop-journal")
+
+        let n = try await store.deleteJournal(deviceId: "noop-journal", day: "2026-06-09",
+                                              question: "Any alcohol?")
+        XCTAssertEqual(n, 1)
+        let imported = try await store.journalEntries(deviceId: "my-whoop",
+                                                      from: "2026-06-01", to: "2026-06-30")
+        XCTAssertEqual(imported.count, 1, "imported row must be untouched")
+        let native = try await store.journalEntries(deviceId: "noop-journal",
+                                                    from: "2026-06-01", to: "2026-06-30")
+        XCTAssertEqual(native.count, 0)
+    }
+
     func testJournalDistinctQuestionsCoexist() async throws {
         let store = try await WhoopStore.inMemory()
         try await store.upsertJournal([
@@ -83,6 +102,65 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
             JournalEntry(day: "2026-05-01", question: "B", answeredYes: false, notes: nil),
         ], deviceId: "devA")
         XCTAssertEqual(n, 2)
+    }
+
+    // MARK: - journal numeric value (#322 / v20)
+
+    func testV20AddsNumericValueColumn() async throws {
+        // The v20 migration must add `numericValue` to the journal table (additive, nullable).
+        let store = try await WhoopStore.inMemory()
+        let cols = try await store.columnNamesForTest(table: "journal")
+        XCTAssertTrue(cols.contains("numericValue"), "v20 must add journal.numericValue")
+        // The PK is unchanged (still natural key), so existing history keys the same way.
+        let pk = try await store.primaryKeyColumns("journal")
+        XCTAssertEqual(pk, ["deviceId", "day", "question"])
+    }
+
+    func testJournalNumericValueRoundTrips() async throws {
+        // A numeric log stores answeredYes=true AND the value; both survive the round-trip.
+        let store = try await WhoopStore.inMemory()
+        let e = JournalEntry(day: "2026-06-20", question: "Caffeine (mg)",
+                             answeredYes: true, notes: nil, numericValue: 180)
+        try await store.upsertJournal([e], deviceId: "noop-journal")
+        let rows = try await store.journalEntries(deviceId: "noop-journal",
+                                                  from: "2026-06-01", to: "2026-06-30")
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].numericValue, 180)
+        XCTAssertTrue(rows[0].answeredYes, "a numeric log is also a yes for the with/without split")
+    }
+
+    func testJournalPlainAnswerHasNilNumericValue() async throws {
+        // A plain yes/no answer (and every legacy/imported row) reads back numericValue == nil.
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertJournal(
+            [JournalEntry(day: "2026-06-20", question: "Alcohol?", answeredYes: false, notes: nil)],
+            deviceId: "noop-journal")
+        let rows = try await store.journalEntries(deviceId: "noop-journal",
+                                                  from: "2026-06-20", to: "2026-06-20")
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertNil(rows[0].numericValue, "a plain answer carries no numeric reading")
+    }
+
+    func testJournalNumericValueUpdatesOnConflict() async throws {
+        // Re-logging the same (day, question) with a new value updates in place (no duplicate),
+        // and clearing the value (nil) round-trips as nil.
+        let store = try await WhoopStore.inMemory()
+        let day = "2026-06-21", q = "Water (L)"
+        try await store.upsertJournal(
+            [JournalEntry(day: day, question: q, answeredYes: true, notes: nil, numericValue: 2)],
+            deviceId: "noop-journal")
+        try await store.upsertJournal(
+            [JournalEntry(day: day, question: q, answeredYes: true, notes: nil, numericValue: 3.5)],
+            deviceId: "noop-journal")
+        var rows = try await store.journalEntries(deviceId: "noop-journal", from: day, to: day)
+        XCTAssertEqual(rows.count, 1, "same natural key must not duplicate")
+        XCTAssertEqual(rows[0].numericValue, 3.5)
+        // Overwrite with a plain answer → numericValue clears to nil.
+        try await store.upsertJournal(
+            [JournalEntry(day: day, question: q, answeredYes: false, notes: nil)],
+            deviceId: "noop-journal")
+        rows = try await store.journalEntries(deviceId: "noop-journal", from: day, to: day)
+        XCTAssertNil(rows[0].numericValue)
     }
 
     // MARK: - workout
@@ -156,6 +234,29 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         XCTAssertEqual(ranged.map { $0.startTs }, [500, 900])
         let limited = try await store.workouts(deviceId: "devA", from: 0, to: 100_000, limit: 1)
         XCTAssertEqual(limited.map { $0.startTs }, [100], "limit honoured, oldest first")
+    }
+
+    func testDeleteWorkoutsBySportAndRange() async throws {
+        // Pins deleteWorkouts (detected-workout idempotency, port of WhoopDao.deleteWorkoutsBySport):
+        // deletes only the matching (deviceId, sport, startTs-range) rows, leaving other sports,
+        // other devices and out-of-range rows untouched.
+        let store = try await WhoopStore.inMemory()
+        func row(_ ts: Int, _ sport: String) -> WorkoutRow {
+            WorkoutRow(startTs: ts, endTs: ts + 600, sport: sport, source: "devA-noop",
+                       durationS: 600, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil,
+                       distanceM: nil, zonesJSON: nil, notes: nil)
+        }
+        try await store.upsertWorkouts([row(1_000, "detected"), row(2_000, "detected"),
+                                        row(1_500, "run")], deviceId: "devA-noop")
+        try await store.upsertWorkouts([row(1_200, "detected")], deviceId: "devA")
+
+        let n = try await store.deleteWorkouts(deviceId: "devA-noop", sport: "detected",
+                                               from: 0, to: 1_800)
+        XCTAssertEqual(n, 1, "only the in-range detected row of the computed source")
+        let left = try await store.workouts(deviceId: "devA-noop", from: 0, to: 10_000, limit: 100)
+        XCTAssertEqual(left.map { $0.startTs }.sorted(), [1_500, 2_000])
+        let other = try await store.workouts(deviceId: "devA", from: 0, to: 10_000, limit: 100)
+        XCTAssertEqual(other.count, 1, "other device untouched")
     }
 
     // MARK: - appleDaily

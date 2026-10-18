@@ -176,23 +176,24 @@ extension WhoopStore {
 extension WhoopStore {
     /// Prune raw outbox rows. Returns the number of rawBatch rows deleted.
     ///
-    /// **Policy 1 (only active policy):** Delete SYNCED batches whose `syncedAt` timestamp
-    /// is older than `now - keepWindowSeconds`. Synced raw is safe to drop because the
-    /// decoded streams are persisted separately.
+    /// **Policy 1:** Delete SYNCED batches whose `syncedAt` timestamp is older than
+    /// `now - keepWindowSeconds`. Synced raw is safe to drop because the decoded streams
+    /// are persisted separately.
     ///
-    /// Unsynced raw is NEVER dropped by this method. Under the offline-first hybrid design
-    /// the locally-stored raw is the sole copy of the strap's "unknown" bytes after a chunk
-    /// is trimmed; dropping it would cause permanent data loss.
+    /// **Policy 2 (size eviction, #27):** Cap the total on-disk raw footprint at
+    /// `maxUnsyncedBytes`. Walk the surviving batches newest-first (`capturedAt DESC`),
+    /// summing `byteSize`, and DELETE every row once the running total exceeds the cap —
+    /// i.e. drop the OLDEST raw. Raw is transient working data, not an archive: the decoded
+    /// streams are persisted BEFORE the raw batch is enqueued (Collector E2 invariant), so
+    /// dropping the oldest raw never loses a decoded metric. Without this an experimental
+    /// capture toggle could grow local storage without bound (a 5/MG user saw 19 GB).
     ///
     /// - Parameters:
-    ///   - now: Current unix-second timestamp used to compute the prune cutoff.
+    ///   - now: Current unix-second timestamp used to compute the synced-aging cutoff.
     ///   - keepWindowSeconds: Synced batches older than `now - keepWindowSeconds` are removed.
-    ///   - maxUnsyncedBytes: Intentionally unused — unsynced raw is the sole copy of unknown
-    ///     bytes post-trim and must never be dropped. Parameter kept for call-site compatibility.
+    ///   - maxUnsyncedBytes: Total raw-footprint cap; oldest batches beyond it are evicted.
     @discardableResult
     public func pruneRaw(now: Int, keepWindowSeconds: Int, maxUnsyncedBytes: Int) async throws -> Int {
-        // maxUnsyncedBytes intentionally unused: unsynced raw is the sole copy of unknown bytes
-        // post-trim and must never be dropped.
         try syncWrite { db in
             var pruned = 0
             // Policy 1: aged synced batches.
@@ -201,6 +202,31 @@ extension WhoopStore {
                 DELETE FROM rawBatch WHERE syncedAt IS NOT NULL AND syncedAt < ?
                 """, arguments: [cutoff])
             pruned += db.changesCount
+
+            // Policy 2 (#27): size-based eviction of the OLDEST raw beyond the cap. Sum byteSize
+            // newest-first; once the cumulative total exceeds maxUnsyncedBytes, the remaining (older)
+            // rows are over budget and get dropped. rowid keeps the cutoff stable regardless of ties
+            // on capturedAt. Decoded streams persist before raw (E2), so this loses no metric.
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT rowid, byteSize FROM rawBatch ORDER BY capturedAt DESC, rowid DESC
+                """)
+            var cumulative = 0
+            var evict: [Int64] = []
+            for row in rows {
+                let size: Int = row["byteSize"]
+                let rowid: Int64 = row["rowid"]
+                cumulative += size
+                if cumulative > maxUnsyncedBytes {
+                    evict.append(rowid)
+                }
+            }
+            if !evict.isEmpty {
+                let placeholders = evict.map { _ in "?" }.joined(separator: ",")
+                try db.execute(
+                    sql: "DELETE FROM rawBatch WHERE rowid IN (\(placeholders))",
+                    arguments: StatementArguments(evict))
+                pruned += db.changesCount
+            }
             return pruned
         }
     }

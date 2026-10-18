@@ -1,6 +1,7 @@
 package com.noop.analytics
 
 import com.noop.data.HrSample
+import kotlin.math.min
 
 /*
  * HrZones.kt — HR-max + 5 heart-rate zones and time-in-zone from an HR stream.
@@ -158,7 +159,7 @@ object HrZones {
                 val gap = (sorted[i + 1].ts - sorted[i].ts).toDouble()
                 // Guard against zero/negative or pathological gaps; cap at the median
                 // so a single huge wall-clock gap doesn't blow up one bucket.
-                if (gap > 0) gap else tailDuration
+                if (gap > 0) min(gap, tailDuration) else tailDuration
             } else {
                 tailDuration
             }

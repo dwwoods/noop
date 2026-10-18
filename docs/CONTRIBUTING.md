@@ -3,7 +3,7 @@
 NOOP is a standalone, fully **offline** companion app for WHOOP straps (4.0 and 5.0). It pairs
 directly with the strap over Bluetooth Low Energy, stores everything on-device in SQLite, imports
 WHOOP CSV exports and Apple Health exports, and computes recovery / strain / HRV / sleep locally —
-no cloud, no account, no subscription. This document explains how the repository is laid out, how to
+no cloud, no account. This document explains how the repository is laid out, how to
 build and test it, the conventions every change is expected to follow, and the safety rules that are
 non-negotiable (especially on the Bluetooth path).
 
@@ -51,7 +51,7 @@ A few principles run through the whole codebase. Internalize them before opening
    [The BLE safety contract](#the-ble-safety-contract-read-this-before-touching-bluetooth).
 4. **Transparent math.** Analytics are approximations of published methods, documented file by file.
    No black boxes, no claims of clinical accuracy, no reproduction of any proprietary model.
-5. **Credit upstream.** The protocol work is built on prior open-source reverse-engineering —
+5. **Credit upstream.** The protocol work is built on prior community reverse-engineering —
    `johnmiddleton12/my-whoop` (WHOOP 4.0) and `b-nnett/goose` (WHOOP 5.0). Preserve those credits in
    code comments and in [`../ATTRIBUTION.md`](../ATTRIBUTION.md).
 
@@ -60,8 +60,10 @@ A few principles run through the whole codebase. Internalize them before opening
 ## Repository layout
 
 The codebase is split into reusable, cross-platform Swift packages plus a thin platform-specific app
-layer. The **macOS app is the reference implementation**; iOS and Android targets are planned and
-reuse the same packages where they can.
+layer. The **macOS app is the reference implementation**; **Android ships as a full app** under
+`android/`, and **iOS was folded into `main` in v1.94** and is a **build-from-source-only target**
+(`NOOPiOS` / `NOOPiOSWidgets`) — no App Store/TestFlight, to keep the project anonymous (see
+[`IOS.md`](IOS.md)). All reuse the same packages where they can.
 
 ```
 Strand/
@@ -79,14 +81,17 @@ Strand/
 ├── StrandTests/                # macOS app unit tests
 ├── Packages/
 │   ├── WhoopProtocol/          # BLE frame parsing, CRC, command/event/packet decode
+│   │                           #   (also builds the `whoop-decode` CLI — runs on Linux)
 │   ├── WhoopStore/             # GRDB/SQLite persistence (migrations, streams, caches)
 │   ├── StrandAnalytics/        # HRV / recovery / strain / sleep / correlation math
 │   ├── StrandImport/           # WHOOP CSV + Apple Health importers
 │   └── StrandDesign/           # SwiftUI design system (palette, components, charts)
 ├── Tools/
 │   └── Backfill/               # `swift run backfill` — re-runs importers into the on-device DB
+├── tools/
+│   └── linux-capture/          # Headless Linux capture workbench (Python/bleak + whoop-decode)
 ├── Fixtures/                   # Sample WHOOP export used by tests
-└── android/                    # Planned Android client (Kotlin/Gradle, separate module)
+└── android/                    # Android client — full shipped app (Kotlin/Gradle, separate module)
 ```
 
 ### Where logic belongs
@@ -100,6 +105,7 @@ Strand/
 | Colors, fonts, motion, cards, charts | `Packages/StrandDesign` | No external UI deps; bridges AppKit/UIKit. |
 | CoreBluetooth, bonding, offload, live state | `Strand/BLE`, `Strand/Collect` | macOS-app layer — wraps the pure packages. |
 | A screen, sidebar item, menu-bar UI, automation | `Strand/Screens`, `Strand/App`, `Strand/System` | App layer. |
+| Capturing strap frames on Linux for protocol RE | `tools/linux-capture` | Python/bleak capture → `whoop-decode`; no Mac/CoreBluetooth. See its [README](../tools/linux-capture/README.md). |
 
 **Rule of thumb:** the more "wire-level" or "math-level" a change is, the deeper into `Packages/` it
 should live, and the more it should be covered by a `swift test` suite that runs without an app, a
@@ -155,6 +161,23 @@ cd Packages/StrandAnalytics && swift build && swift test
 cd Packages/StrandImport   && swift build && swift test
 cd Packages/StrandDesign   && swift build && swift test
 ```
+
+### Linux (protocol RE)
+
+The pure packages build and test on Linux with the standard Swift toolchain (no Apple frameworks).
+`WhoopProtocol` also produces a `whoop-decode` CLI used by the Linux capture workbench:
+
+```bash
+cd Packages/WhoopProtocol
+swift build && swift test                 # decoder + its tests, on Linux
+swift build --product whoop-decode        # the decode CLI → .build/debug/whoop-decode
+
+cd ../../tools/linux-capture
+python3 -m unittest -v                     # framing/reassembly tests (stdlib only, no bleak)
+```
+
+Capturing from a real strap on Linux is documented in
+[`../tools/linux-capture/README.md`](../tools/linux-capture/README.md).
 
 ### macOS app
 
@@ -456,31 +479,55 @@ Schema lives in `Packages/WhoopStore/Sources/WhoopStore/Database.swift` as a **v
 - **No proprietary material.** Don't add WHOOP firmware, decompiled app code, logos, or assets, and
   don't introduce DRM circumvention. Keep contributions to clean-room interoperability with hardware
   the user owns.
+- **Licensing.** By opening a pull request you agree your contribution is licensed under the same
+  [PolyForm Noncommercial License 1.0.0](../LICENSE) as the rest of NOOP. Forks and personal,
+  non-commercial use are welcome under those terms.
+
+---
+
+## Versioning
+
+NOOP follows [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`:
+
+- **PATCH** (e.g. `2.0.1`) — bug fixes, diagnostics, small tweaks.
+- **MINOR** (e.g. `2.1.0`) — a new, backwards-compatible feature.
+- **MAJOR** (e.g. `3.0.0`) — a milestone, redesign, or a change that breaks an existing setup or data.
+
+The three parts are independent counters, **not** decimals: `2.0.10` follows `2.0.9`, and there's no
+"next number after `1.99`" — a new feature line is `2.1.0`, not `1.100`. The marketing version lives
+in `project.yml` (`MARKETING_VERSION`) and `android/app/build.gradle.kts` (`versionName`); the build
+numbers (`CFBundleVersion` / `versionCode`) increment independently on every release.
 
 ---
 
 ## Roadmap
 
-NOOP's logic already lives in cross-platform packages, so most roadmap items are app-layer wiring
-rather than rewrites of the core. Today the **macOS app is the working reference implementation**;
-everything below is planned or deferred. Contributions toward these are welcome — open an issue to
-coordinate first.
+NOOP's logic already lives in cross-platform packages, so most platform work is app-layer wiring
+rather than rewrites of the core. Today the **macOS app is the working reference implementation**
+and **Android ships as a full app**; the items below are planned, experimental, or deferred.
+Contributions toward these are welcome — open an issue to coordinate first.
 
-### Planned platforms
+### Other platforms
 
-- **Windows app.** A native desktop client for Windows. The protocol facts in
+- **Windows app (planned).** A native desktop client for Windows. The protocol facts in
   `WhoopProtocol/Resources/whoop_protocol.json` and the framing/CRC rules are language-agnostic, so
   the wire behavior is portable; the work is a Windows BLE stack + UI re-implementation that matches
   the shared packages' behavior.
-- **Android device validation.** An `android/` module is scaffolded for a native Kotlin/Gradle
-  client that re-implements the same wire protocol against Android's BLE stack. The near-term task is
-  **validating bond + offload against real WHOOP hardware** on Android and confirming parity with the
-  Swift decode path. (An emulator can't reach a physical strap — this needs a device.)
-- **iOS app.** Every package already declares `.iOS(.v16)` and guards UI-framework code with
-  `#if canImport(UIKit)/AppKit`, so the non-UI core compiles for iOS today. Adding the app is mostly
-  app-layer wiring: an iOS application target depending on the same packages, the iOS Bluetooth
-  Info.plist/entitlements + background mode, and AppKit→UIKit swaps for the handful of macOS-only app
-  files. See [`IOS.md`](IOS.md) for the detailed port plan.
+- **Android (shipped).** A full, native Kotlin/Gradle client lives under `android/`, re-implementing
+  the same wire protocol against Android's BLE stack — it pairs, offloads, persists and scores
+  on-device, and imports WHOOP / Apple Health / Health Connect. Pre-built APKs are in
+  [Releases](https://github.com/NoopApp/noop/releases). Continued real-hardware testing across more devices is always welcome
+  (an emulator can't reach a physical strap).
+- **iOS (build-from-source target on `main`).** iOS was folded into `main` in v1.94 as a first-class
+  build-from-source target — the `NOOPiOS` and `NOOPiOSWidgets` schemes (app target plus widgets, a
+  Live Activity, and HealthKit), built against current code in Xcode, with CI compiling both macOS and
+  iOS on every change. It is **build-it-yourself only, intentionally not shipped:** iOS has no
+  anonymous distribution path (the App Store and TestFlight both require a real Apple Developer
+  identity), which is at odds with NOOP staying anonymous, so there are no pre-built downloads. Every
+  package declares `.iOS(.v16)` and guards UI-framework code with `#if canImport(UIKit)/AppKit`, so
+  the shared core and analytics run unmodified — results match macOS. It is newer and less
+  battle-tested than macOS/Android (live BLE on a real iPhone isn't fully validated yet), so
+  on-hardware testing is especially welcome; [`IOS.md`](IOS.md) is the detailed guide.
 
 ### Deferred ideas
 
@@ -495,10 +542,6 @@ These are scoped but intentionally not built yet. They're listed so contributors
 - **Notification-watcher helper.** A small, opt-in helper to mirror selected macOS notifications to a
   haptic cue on the strap. Strictly local, off by default, and bounded — no general-purpose
   notification scraping.
-- **Local AI coach.** An **on-device**, offline assistant that reasons over your own series (recovery
-  / strain / sleep / HRV trends) to produce plain-language guidance. Hard requirement: it must stay
-  local and offline — no cloud inference, no data leaving the device — consistent with NOOP's
-  offline-by-design principle. Any output remains an approximation and is not medical advice.
 
 > Roadmap items don't change the ground rules. Everything above still holds: offline-only, no
 > destructive BLE commands, CRC-gated, design-system-only UI, transparent and clearly-non-clinical

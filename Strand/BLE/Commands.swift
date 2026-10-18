@@ -17,7 +17,18 @@ public enum WhoopCommand: UInt8, CaseIterable {
     case getBatteryLevel       = 26
     case getDataRange          = 34
     case getHelloHarvard       = 35
+    /// WHOOP 5.0/MG hello (the puffin generation's GET_HELLO). The response carries the device name
+    /// and the firmware version (`fw_version` a.b.c.d), which we surface on the Devices card. A WHOOP
+    /// 4.0 answers "unsupported" and ignores it, so this is only sent to a 5/MG strap. Read-only.
+    case getHello              = 145
     case getAdvertisingNameHarvard = 76
+    /// SET_ADVERTISING_NAME_HARVARD (77) — rename the strap's BLE advertising name on a WHOOP 4.0
+    /// (Harvard). Payload = `advertisingNamePayload(_:)` (a 2-byte header + UTF-8 name + trailing NUL,
+    /// the form WHOOP 4.0 firmware accepts). The strap reboots to apply, so the new name shows on the
+    /// next connect (the connect handshake re-reads it via cmd 76). WHOOP 4.0 only — a 5/MG uses puffin
+    /// framing and a different device-config path. Reversible (rename again any time). Driven only by
+    /// `BLEManager.renameStrap(_:)`.
+    case setAdvertisingNameHarvard = 77
     case startRawData          = 81
     case stopRawData           = 82
     case enterHighFreqSync     = 96
@@ -28,6 +39,19 @@ public enum WhoopCommand: UInt8, CaseIterable {
     case getExtendedBatteryInfo = 98
     case toggleIMUMode         = 106
     case enableOpticalData     = 107
+    /// SET_CONFIG / SET_FF_VALUE (0x78) — write one persistent device feature-flag. Used by the
+    /// WHOOP 5.0/MG "enable R22 packets" sequence that switches on the deep biometric streams the
+    /// strap otherwise withholds from third-party apps (documented independently by judes.club and
+    /// Asherlc/dofek; see Whoop5Config). Payload = `[0x01] + Whoop5Config.payload(name:value:)`
+    /// (a 40-byte NUL-padded ASCII flag name + an ASCII '1'/'2' value byte). Reversible — it only
+    /// toggles which data the strap emits, and is gated behind an opt-in. iOS/Android only on real
+    /// hardware (macOS cannot complete the authenticated bond required to write commands).
+    case setConfig             = 120
+    /// SET_DEVICE_CONFIG (0x77) — writes ONE persistent device-config value (distinct from the
+    /// feature-flag SET_CONFIG/0x78). Used for the "Broadcast HR" flag (`whoop_live_hr_in_adv_ind_pkt`),
+    /// which makes the strap advertise its HR as a standard 0x180D BLE sensor. Reversible; gated behind
+    /// the broadcast-HR opt-in. iOS/Android only (macOS can't bond a 5/MG). (#181)
+    case setDeviceConfig       = 119
     /// Fire a preset haptic pattern. Payload = `[patternId, numLoops, 0, 0, 0]` (5 bytes, from
     /// the device's preset table). patternId indexes the device's preset patterns (GET_ALL_HAPTICS_PATTERN
     /// reports 7 on harvard); the official app fires id=2. Safe/reversible — just buzzes the motor.
@@ -44,7 +68,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
     // MARK: Alarm commands (confirmed for interoperability)
     /// Arm the strap's FIRMWARE alarm for a specific UTC time. The strap will buzz at that time
     /// even if the app is backgrounded or killed (event STRAP_DRIVEN_ALARM_EXECUTED=57).
-    /// Payload: `setAlarmPayload(epochSec:)` → [0x01] + u32 LE + [0x00, 0x00] (7 bytes).
+    /// Payload: `setAlarmPayload(epochSec:)` → [0x01] + u32 LE + [0x00, 0x00] + [0x00, 0x00] (9 bytes).
     /// IMPORTANT: always send SET_CLOCK (cmd 10) immediately before this to ensure the strap RTC
     /// is UTC-correct, otherwise the alarm fires at the wrong wall-clock time.
     case setAlarmTime          = 66
@@ -69,7 +93,9 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .getBatteryLevel:       return "Get Battery Level"
         case .getDataRange:          return "Get Data Range"
         case .getHelloHarvard:       return "Get Hello (Harvard)"
+        case .getHello:              return "Get Hello (5/MG)"
         case .getAdvertisingNameHarvard: return "Get Advertising Name (Harvard)"
+        case .setAdvertisingNameHarvard: return "Set Advertising Name (Harvard)"
         case .startRawData:          return "Start Raw Data"
         case .stopRawData:           return "Stop Raw Data"
         case .enterHighFreqSync:     return "Enter High-Freq Sync"
@@ -77,6 +103,8 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .getExtendedBatteryInfo:return "Get Extended Battery Info"
         case .toggleIMUMode:         return "Toggle IMU Mode"
         case .enableOpticalData:     return "Enable Optical Data"
+        case .setConfig:             return "Set Config (R22 feature flag)"
+        case .setDeviceConfig:       return "Set Device Config (broadcast HR)"
         case .runHapticsPattern:     return "Run Haptics Pattern"
         case .stopHaptics:           return "Stop Haptics"
         case .sendR10R11Realtime:    return "R10/R11 Realtime (raw stream)"
@@ -89,18 +117,45 @@ public enum WhoopCommand: UInt8, CaseIterable {
 
     // MARK: Payload builders
 
-    /// SET_ALARM_TIME (66) payload: Rev1 form (observed).
-    /// Layout: `[0x01] + <epoch u32 LE> + [0x00, 0x00]` = 7 bytes total.
-    /// The leading 0x01 is the sub-command / form byte; the 2-byte subseconds field is zero
-    /// (the strap only uses the seconds portion). Always send SET_CLOCK (cmd 10) first so the
-    /// strap RTC is UTC-correct, otherwise the alarm fires at the wrong wall-clock time.
+    /// SET_ALARM_TIME (66) payload: Rev1 form.
+    /// Layout: `[0x01] + <epoch u32 LE> + [0x00, 0x00] + [0x00, 0x00]` = 9 bytes total.
+    /// The leading 0x01 is the sub-command / form byte; bytes 5-6 are subseconds (always 0 — this is a
+    /// minute-precision alarm); bytes 7-8 are a haptic-mode field. Always send SET_CLOCK (cmd 10) first
+    /// so the strap RTC is UTC-correct, otherwise the alarm fires at the wrong wall-clock time.
+    ///
+    /// The earlier 7-byte form dropped the trailing 2-byte haptic-mode field. On #428 the strap ACKed
+    /// that shorter frame and logged "armed" but never buzzed (no STRAP_DRIVEN_ALARM_EXECUTED event).
+    /// @ujix's btsnoop capture of the official WHOOP app on a real 4.0 (PR #535) shows the official app
+    /// always sends 9 bytes — the two trailing zero bytes are the missing haptic-mode field. The byte
+    /// layout is now pinned by SetAlarmPayloadTests against that capture.
+    ///
+    /// CONFIRMED WORKING on WHOOP 4.0: the capture author tested this 9-byte frame on a real strap and
+    /// the alarm buzzes at the specified time (PR #535, 2026-06-20) - wire capture plus on-device
+    /// verification. That's one device/firmware, so the UI keeps a "keep a backup alarm" caveat for
+    /// anything critical. Do NOT guess additional fields beyond the captured frame.
     public static func setAlarmPayload(epochSec: UInt32) -> [UInt8] {
         [0x01,
          UInt8(epochSec & 0xFF),
          UInt8((epochSec >> 8) & 0xFF),
          UInt8((epochSec >> 16) & 0xFF),
          UInt8((epochSec >> 24) & 0xFF),
-         0x00, 0x00]
+         0x00, 0x00, // subseconds (always 0 — minute precision)
+         0x00, 0x00] // haptic-mode field (from @ujix's official-app wire capture, #535)
+    }
+
+    /// Max UTF-8 byte length for a strap advertising name. BLE caps the whole advertising payload at
+    /// 31 bytes; keeping the name ≤ 24 leaves room for the rest of the AD structure (flags + service
+    /// UUID) the strap still has to broadcast.
+    public static let maxAdvertisingNameBytes = 24
+
+    /// SET_ADVERTISING_NAME_HARVARD (77) payload: `[0x00, 0x00] + <UTF-8 name> + [0x00]`.
+    /// The 2-byte header + trailing NUL is the `h2z` layout verified against the whoop-rename prototype
+    /// on WHOOP 4.0 firmware. The name is clamped to `maxAdvertisingNameBytes` on a Unicode-scalar
+    /// boundary (never splitting a multibyte character) so it can't overflow the BLE advertising packet.
+    public static func advertisingNamePayload(_ name: String) -> [UInt8] {
+        var clamped = name
+        while clamped.utf8.count > maxAdvertisingNameBytes { clamped.removeLast() }
+        return [0x00, 0x00] + Array(clamped.utf8) + [0x00]
     }
 
     /// COMMAND packet type byte (PacketType.COMMAND).

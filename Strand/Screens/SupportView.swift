@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 import StrandDesign
 
 /// Support — attribution + optional crypto donations. Never a paywall; the whole app works without it.
@@ -9,48 +8,91 @@ struct SupportView: View {
 
     var body: some View {
         ScreenScaffold(title: "Support",
-                       subtitle: "\(ProjectInfo.appName) is free and always will be. If it saved you a subscription, you can chip in — totally optional.") {
-            builtOnCard
-            donateCard
-            contactCard
-            disclaimerCard
-        }
-    }
-
-    private var contactCard: some View {
-        StrandCard(padding: 20) {
-            HStack(spacing: 12) {
-                Image(systemName: "envelope.fill").foregroundStyle(StrandPalette.accent).accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Get in touch").font(StrandFont.headline).foregroundStyle(StrandPalette.textPrimary)
-                    Text("Questions, feedback, bugs — \(ProjectInfo.contactEmail)")
-                        .font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+                       subtitle: "\(ProjectInfo.appName) is free and always will be. If it's useful to you, you can chip in to help with development and testing costs. Totally optional.") {
+            VStack(alignment: .leading, spacing: NoopMetrics.sectionSpacing) {
+                VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
+                    SectionHeader("Support the build", overline: "Optional")
+                    donateCard
                 }
-                Spacer(minLength: 8)
-                Button {
-                    if let url = URL(string: "mailto:\(ProjectInfo.contactEmail)") { NSWorkspace.shared.open(url) }
-                } label: { Label("Email", systemImage: "paperplane.fill") }
-                .buttonStyle(.bordered).tint(StrandPalette.accent)
-                .help("Email \(ProjectInfo.contactEmail)")
+                .staggeredAppear(index: 0)
+                VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
+                    SectionHeader("Help & Contact", overline: "Get in touch")
+                    contactCard
+                    builtOnCard
+                }
+                .staggeredAppear(index: 1)
+                disclaimerCard
+                    .staggeredAppear(index: 2)
             }
         }
     }
 
+    /// One hairline-divided row inside a grouped frosted card: a tinted leading glyph, a title +
+    /// detail stack, and a trailing accent chevron when the row taps through to an action.
+    @ViewBuilder
+    private func groupedRow(icon: String, tint: Color, title: LocalizedStringKey,
+                            detail: String, showsChevron: Bool) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 28, height: 28)
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(StrandFont.headline).foregroundStyle(StrandPalette.textPrimary)
+                Text(detail).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(StrandPalette.accent)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private var contactCard: some View {
+        NoopCard {
+            Button {
+                if let url = URL(string: "mailto:\(ProjectInfo.contactEmail)") { PlatformOpen.url(url) }
+            } label: {
+                groupedRow(icon: "envelope.fill", tint: StrandPalette.accent,
+                           title: "Get in touch",
+                           detail: String(localized: "Questions, feedback, bugs: \(ProjectInfo.contactEmail)"),
+                           showsChevron: true)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Email \(ProjectInfo.contactEmail)")
+            .help("Email \(ProjectInfo.contactEmail)")
+        }
+    }
+
     private var builtOnCard: some View {
-        StrandCard(padding: 20) {
+        NoopCard {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 10) {
-                    Image(systemName: "hands.clap.fill").foregroundStyle(StrandPalette.accent).accessibilityHidden(true)
+                    Image(systemName: "hands.clap.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(StrandPalette.accent)
+                        .frame(width: 28, height: 28)
+                        .background(StrandPalette.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .accessibilityHidden(true)
                     Text("Built on").font(StrandFont.headline).foregroundStyle(StrandPalette.textPrimary)
                 }
-                Text("This stands on open-source reverse-engineering. Huge thanks:")
+                Text("This stands on community reverse-engineering. Huge thanks:")
                     .font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
-                ForEach(ProjectInfo.attributions, id: \.repo) { a in
+                ForEach(Array(ProjectInfo.attributions.enumerated()), id: \.element.repo) { index, a in
+                    if index > 0 { Divider().overlay(StrandPalette.hairline) }
                     HStack(spacing: 8) {
                         Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(StrandPalette.accent).accessibilityHidden(true)
                         Text(a.repo).font(StrandFont.mono(12)).foregroundStyle(StrandPalette.textPrimary)
                         Text("· \(a.note)").font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                        Spacer(minLength: 0)
                     }
                 }
             }
@@ -58,33 +100,38 @@ struct SupportView: View {
     }
 
     private var donateCard: some View {
-        StrandCard(padding: 20) {
+        NoopCard(tint: StrandPalette.metricRose) {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 10) {
-                    Image(systemName: "heart.fill").foregroundStyle(StrandPalette.metricRose).accessibilityHidden(true)
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(StrandPalette.metricRose)
+                        .frame(width: 28, height: 28)
+                        .background(StrandPalette.metricRose.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .accessibilityHidden(true)
                     Text("Support the build").font(StrandFont.headline).foregroundStyle(StrandPalette.textPrimary)
                     Spacer()
                 }
-                Text("NOOP is free and always will be — no subscription, no paywall, nothing locked. But it cost real money and a lot of unpaid hours to build, and there's a Windows app, an Android app and an iOS app I want to ship next. If it saved you a subscription, even a few quid in crypto genuinely keeps it moving — and honestly, it keeps me motivated to keep building.")
+                Text("NOOP is free and always will be, nothing is locked. It cost real money and a lot of unpaid hours to build, and there's a Windows app, an Android app and an iOS app I want to ship next. If it's useful to you and you want to help with the development and testing costs, even a few quid in crypto genuinely keeps it moving, and honestly it keeps me motivated to keep building.")
                     .font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "lock.shield.fill").foregroundStyle(StrandPalette.accent)
                         .font(.system(size: 13)).accessibilityHidden(true)
-                    Text("I keep this project anonymous, so crypto is the only way to chip in — no Patreon, no PayPal, no name attached. Quick, global, and private for both of us.")
+                    Text("I keep this project anonymous, so crypto is the only way to chip in: no Patreon, no PayPal, no name attached. Quick, global, and private for both of us.")
                         .font(StrandFont.footnote).foregroundStyle(StrandPalette.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                .padding(NoopMetrics.space3).frame(maxWidth: .infinity, alignment: .leading)
                 .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
                 // Pick a coin → scan the QR or copy the address.
-                HStack(spacing: 8) {
+                HStack(spacing: NoopMetrics.space2) {
                     ForEach(ProjectInfo.donations) { coin in
                         let on = selected == coin.symbol
                         Button { withAnimation(.easeOut(duration: 0.15)) { selected = coin.symbol } } label: {
-                            Text(coin.symbol).font(.system(size: 12, weight: .bold))
+                            Text(coin.symbol).font(StrandFont.rounded(12, weight: .bold))
                                 .padding(.horizontal, 14).padding(.vertical, 7)
                                 .background(Capsule().fill(on ? StrandPalette.accent : StrandPalette.surfaceInset))
                                 .foregroundStyle(on ? StrandPalette.surfaceBase : StrandPalette.textSecondary)
@@ -106,21 +153,20 @@ struct SupportView: View {
                                 .font(StrandFont.mono(11)).foregroundStyle(StrandPalette.textSecondary)
                                 .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                             Button {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(coin.address, forType: .string)
+                                PlatformPasteboard.copy(coin.address)
                                 withAnimation { copied = coin.symbol }
                             } label: {
                                 Label(copied == coin.symbol ? "Copied!" : "Copy address",
                                       systemImage: copied == coin.symbol ? "checkmark" : "doc.on.doc")
                             }
-                            .buttonStyle(.bordered).tint(StrandPalette.accent)
+                            .buttonStyle(NoopButtonStyle(.secondary))
                             .accessibilityLabel("Copy \(coin.name) address")
                         }
                         Spacer(minLength: 0)
                     }
                 }
 
-                Text("Any amount helps. Thank you — genuinely.")
+                Text("Any amount helps. Thank you, genuinely.")
                     .font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
             }
         }
@@ -130,7 +176,7 @@ struct SupportView: View {
     private func qrView(_ address: String) -> some View {
         Group {
             if let img = QRCode.image(for: address) {
-                Image(nsImage: img).resizable().interpolation(.none)
+                Image(platformImage: img).resizable().interpolation(.none)
             } else {
                 RoundedRectangle(cornerRadius: 8, style: .continuous).fill(StrandPalette.surfaceInset)
             }
@@ -142,11 +188,11 @@ struct SupportView: View {
     }
 
     private var disclaimerCard: some View {
-        StrandCard(padding: 18) {
+        NoopCard(padding: 18) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "info.circle.fill").foregroundStyle(StrandPalette.textTertiary)
                     .font(.system(size: 13)).accessibilityHidden(true)
-                Text("Not affiliated with, endorsed by, or connected to WHOOP. Interoperability software for your own device and data. Not a medical device.")
+                Text("Not affiliated with, endorsed by, or connected to WHOOP. Interoperability software for hardware you own and your own data. Use it only with a device you own, and not in breach of any agreement that applies to you. Not a medical device.")
                     .font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -189,7 +235,9 @@ struct SupportModalOverlay: View {
                 }
                 .shadow(color: Color.black.opacity(0.5), radius: 30, x: 0, y: 14)
         }
-        .onExitCommand { isPresented = false }
+        #if os(macOS)
+        .onExitCommand { isPresented = false }   // Esc-to-close is a macOS-only command
+        #endif
         .transition(.opacity)
     }
 }
