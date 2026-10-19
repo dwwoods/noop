@@ -1,11 +1,17 @@
 import Foundation
 import WhoopProtocol
 
-// StrainScorer.swift — cardiovascular load on a 0–21 logarithmic strain scale.
+// StrainScorer.swift — cardiovascular load on a 0–100 logarithmic strain ("Effort") scale.
 //
 // Ported from server/ingest/app/analysis/strain.py. INDEPENDENT implementation of
 // published exercise-physiology methods (WHOOP-*like*, not a reproduction of the
 // proprietary algorithm; not medical advice).
+//
+// Scale note: the metric was historically 0–21 (WHOOP's Strain axis); the
+// "Charge / Effort / Rest" redesign rescales the OUTPUT to 0–100 by raising
+// `maxStrain` 21.0 → 100.0 only. The denominator D = 7201 is unchanged, so the log
+// curve and its saturation point (TRIMP 7200 ≈ max) are preserved — a max Effort day
+// stays as rare as a 21.0 day used to be. Internal metric key stays `strain`.
 //
 // Pipeline:
 //   1. Heart-Rate Reserve (Karvonen): HRR = HRmax − RHR.
@@ -14,8 +20,8 @@ import WhoopProtocol
 //        a. Edwards 5-zone summation (default): sample contributes its zone weight
 //           (1..5 at 50/60/70/80/90 %HRR cut-offs) × duration.
 //        b. Banister exponential: sample contributes duration × x × 0.64 × e^(b·x).
-//   4. Logarithmic compression onto [0, 21]:
-//        strain = 21 × ln(TRIMP + 1) / ln(D),  D = STRAIN_DENOMINATOR.
+//   4. Logarithmic compression onto [0, 100]:
+//        strain = 100 × ln(TRIMP + 1) / ln(D),  D = STRAIN_DENOMINATOR.
 //
 // References: Karvonen 1957 (%HRR); Edwards 1993 (5-zone TRIMP); Banister 1991
 // (exponential TRIMP, b = 1.92 men / 1.67 women); Tanaka 2001 (HRmax = 208 − 0.7×age).
@@ -24,13 +30,25 @@ public enum StrainScorer {
 
     // MARK: - Constants (strain.py)
 
-    /// Minimum HR readings before computing strain (≈10 min at 1 Hz).
+    /// Minimum HR readings before computing strain on a DENSE stream (≈10 min at 1 Hz).
     public static let minReadings: Int = 600
-    /// Top of the strain scale.
-    public static let maxStrain: Double = 21.0
+    /// Sparse-stream acceptance (#482/#480): a low-cadence strap — the WHOOP 5/MG sends live
+    /// standard HR only ~every 30 s — would need ~5 h of continuous wear to reach `minReadings`,
+    /// so Effort sat un-scored (nil → the gauge showed a stale prior-day value) for most of the day.
+    /// Also accept once the HR series SPANS at least `minSpanSeconds` of wall-clock with a small
+    /// sample floor. This never fabricates load: TRIMP still integrates honestly over whatever HR is
+    /// there, so a genuine low-HR day scores 0 either way — it just lets the live gauge reflect TODAY
+    /// instead of yesterday. A dense 1 Hz stream is unaffected (it clears `minReadings` first).
+    public static let minSparseReadings: Int = 20
+    /// Wall-clock coverage (seconds) that qualifies a sparse stream. 600 s = 10 min, matching the
+    /// dense gate's ≈10 min of 600 × 1 Hz samples, so both cadences trust the number at the same age.
+    public static let minSpanSeconds: Int = 600
+    /// Top of the strain ("Effort") scale. Rescaled 21.0 → 100.0 for the
+    /// Charge/Effort/Rest redesign; only the output scale changes, the curve does not.
+    public static let maxStrain: Double = 100.0
 
     /// Logarithmic-map denominator D. Chosen so the Edwards daily ceiling
-    /// (top zone weight 5 sustained 24 h = 7200) maps to exactly 21.0:
+    /// (top zone weight 5 sustained 24 h = 7200) maps to exactly maxStrain:
     /// D = 7200 + 1 = 7201 makes ln(7201)/ln(7201) = 1.
     public static let strainDenominator: Double = 7201.0
     static var lnStrainDenominator: Double { log(strainDenominator) }
@@ -57,7 +75,7 @@ public enum StrainScorer {
     ]
 
     /// TRIMP accumulation method.
-    public enum Method: Sendable { case edwards, banister }
+    public enum Method: Sendable, Hashable { case edwards, banister }
 
     // MARK: - HRmax helpers
 
@@ -141,7 +159,7 @@ public enum StrainScorer {
 
     // MARK: - Logarithmic map
 
-    /// Map accumulated TRIMP onto [0, 21] via 21 × ln(TRIMP+1) / ln(D), 2 dp.
+    /// Map accumulated TRIMP onto [0, 100] via 100 × ln(TRIMP+1) / ln(D), 2 dp.
     /// TRIMP ≤ 0 → 0.
     public static func trimpToStrain(_ trimp: Double, denominator: Double = strainDenominator) -> Double {
         if trimp <= 0 { return 0 }
@@ -152,7 +170,8 @@ public enum StrainScorer {
     // MARK: - Denominator calibration
 
     /// Calibrate D from (TRIMP, reference_strain) pairs via the through-origin
-    /// least-squares line: ln(D) = 21 × Σ(x²) / Σ(xy), x = ln(TRIMP+1).
+    /// least-squares line: ln(D) = maxStrain × Σ(x²) / Σ(xy), x = ln(TRIMP+1).
+    /// (reference_strain pairs must be on the same 0–maxStrain axis as the output.)
     /// Throws when fewer than 2 usable pairs (TRIMP>0, strain>0) or degenerate.
     public static func fitStrainDenominator(_ pairs: [(trimp: Double, strain: Double)]) throws -> Double {
         let usable = pairs.filter { $0.trimp > 0 && $0.strain > 0 }
@@ -174,10 +193,11 @@ public enum StrainScorer {
 
     // MARK: - Public API
 
-    /// Cardiovascular strain (0–21) from an HR series. APPROXIMATE.
+    /// Cardiovascular strain / "Effort" (0–100) from an HR series. APPROXIMATE.
     ///
-    /// Returns nil when there are fewer than `minReadings` samples or
-    /// maxHR ≤ restingHR (invalid HRR).
+    /// Returns nil when there isn't yet enough data to trust the number — fewer than
+    /// `minReadings` samples AND less than `minSpanSeconds` of HR coverage (the sparse-strap
+    /// path, #482) — or when maxHR ≤ restingHR (invalid HRR).
     ///
     /// - Parameters:
     ///   - hr: time-ordered `[HRSample]`.
@@ -192,8 +212,42 @@ public enum StrainScorer {
                               method: Method = .edwards,
                               sex: String = "male",
                               denominator: Double = strainDenominator) -> Double? {
+        // v7.0.2 perf (#707): TRIMP integrates over the day's HR stream; called once per day in the post-sync
+        // scoring loop AND from the Today view (which re-reads on each live-HR tick). Memoize on the HR
+        // fingerprint + every scalar that steers the score, so an identical re-request is a lookup. The
+        // result is a single `Double?`; the HR array is not retained.
+        let key = StrainKey(
+            hr: StreamFingerprint.of(hr, ts: { $0.ts }, quant: { Int($0.bpm) }),
+            maxHR: maxHR, restingHR: restingHR, method: method,
+            sexF: sex.lowercased().hasPrefix("f"), denom: denominator)
+        return strainCache.value(key) {
+            strainUncached(hr, maxHR: maxHR, restingHR: restingHR, method: method, sex: sex, denominator: denominator)
+        }
+    }
+
+    /// Key folds `sex` to the single bit the recipe reads (`hasPrefix("f")`) so "female"/"f"/"F" all hit.
+    private struct StrainKey: Hashable {
+        let hr: StreamFingerprint
+        let maxHR: Double?; let restingHR: Double; let method: Method
+        let sexF: Bool; let denom: Double
+    }
+    private static let strainCache = AnalyticsMemoCache<StrainKey, Double?>(capacity: 48)
+
+    private static func strainUncached(_ hr: [HRSample], maxHR: Double?, restingHR: Double,
+                                       method: Method, sex: String, denominator: Double) -> Double? {
         let effMax = maxHR ?? Double(defaultMaxHR())
-        if hr.count < minReadings || effMax <= restingHR { return nil }
+        // Enough data to trust the score: a dense stream (≥ minReadings) OR a sparse-but-sustained
+        // one spanning ≥ minSpanSeconds with a sample floor (#482 — the 5/MG's ~30 s HR cadence).
+        let enoughData: Bool
+        if hr.count >= minReadings {
+            enoughData = true
+        } else if hr.count >= minSparseReadings {
+            let tss = hr.map { $0.ts }
+            enoughData = ((tss.max() ?? 0) - (tss.min() ?? 0)) >= minSpanSeconds
+        } else {
+            enoughData = false
+        }
+        if !enoughData || effMax <= restingHR { return nil }
 
         let sampleDur = sampleDurationMinutes(hr)
         let hrReserve = effMax - restingHR

@@ -72,6 +72,10 @@ enum class EventNumber(val rawValue: Int) {
  */
 enum class CommandNumber(val rawValue: Int) {
     TOGGLE_REALTIME_HR(3),
+    // REPORT_VERSION_INFO (7): WHOOP 4.0 firmware/version read. The strap answers with the bundled
+    // component versions (`fw_harvard` a.b.c.d, `fw_boylston` a.b.c.d). A documented READ command,
+    // separate from the firmware-LOAD opcodes. Mirrors Swift `WhoopCommand.reportVersionInfo`.
+    REPORT_VERSION_INFO(7),
     SET_CLOCK(10),
     GET_CLOCK(11),
     SEND_HISTORICAL_DATA(22),
@@ -82,13 +86,34 @@ enum class CommandNumber(val rawValue: Int) {
     GET_BATTERY_LEVEL(26),
     GET_DATA_RANGE(34),
     GET_HELLO_HARVARD(35),
+    // GET_HELLO (145): WHOOP 5.0/MG hello. The response carries the device name plus `fw_version`
+    // a.b.c.d. Older 4.0 firmware replies "unsupported" (0a03) and is ignored. Mirrors Swift
+    // `WhoopCommand.getHello`.
+    GET_HELLO(145),
     SEND_R10_R11_REALTIME(63),
+    // WHOOP 5.0/MG (device family GOOSE/MAVERICK) one-shot buzz. Gen-4 straps use the legacy
+    // RUN_HAPTICS_PATTERN(79) below; a 5/MG strap only honors this command.
+    RUN_HAPTIC_PATTERN_MAVERICK(19),
     SET_ALARM_TIME(66),
     GET_ALARM_TIME(67),
     RUN_ALARM(68),
     DISABLE_ALARM(69),
+    // SET_ADVERTISING_NAME_HARVARD (77) — rename the WHOOP 4.0's BLE advertising name on the strap
+    // firmware (the name the OS shows in Bluetooth). Payload: [0x00,0x00] + UTF-8 name + [0x00]; the
+    // strap reboots to apply. WHOOP 4.0 only (a 5/MG uses puffin framing + a different config path).
+    // Port of Swift WhoopCommand.setAdvertisingNameHarvard.
+    SET_ADVERTISING_NAME(77),
     RUN_HAPTICS_PATTERN(79),
     GET_ALL_HAPTICS_PATTERN(80),
+    // SET_CONFIG / SET_FF_VALUE (0x78) — write one persistent feature flag. The 5/MG "enable R22
+    // packets" sequence (Whoop5Config) sends 15 of these to switch on the deep biometric streams.
+    // Reversible; gated behind the deep-data opt-in; iOS/Android only. (#174)
+    SET_CONFIG(120),
+    // SET_DEVICE_CONFIG (0x77) — write one persistent DEVICE-config value (distinct from the
+    // feature-flag SET_CONFIG/0x78). Used for the "Broadcast HR" flag whoop_live_hr_in_adv_ind_pkt,
+    // which makes the strap advertise its HR as a standard 0x180D BLE sensor. Validated on real
+    // hardware (paired on a Garmin Edge 840). Reversible; gated behind the broadcast-HR opt-in. (#181)
+    SET_DEVICE_CONFIG(119),
     START_RAW_DATA(81),
     STOP_RAW_DATA(82),
     STOP_HAPTICS(122),

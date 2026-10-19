@@ -4,6 +4,7 @@ import com.noop.data.GravitySample
 import com.noop.data.HrSample
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.min
 import kotlin.math.roundToLong
 import kotlin.math.sqrt
 
@@ -41,6 +42,19 @@ object WorkoutDetector {
     const val minIntensityZ2Plus: Double = 0.50
     const val alignToleranceS: Double = 5.0
     const val restingPercentile: Double = 10.0
+
+    /**
+     * Second-pass bridge window (#303). Two adjacent active runs separated by a
+     * below-motion-threshold gap no longer than this are stitched into one workout —
+     * BUT ONLY while HR stays elevated across the gap (see [bridgeRuns]). A sustained
+     * endurance effort (e.g. a long bike ride) routinely dips below the motion gate
+     * for a few minutes — coasting a descent, a junction, a brief sensor dropout —
+     * without the athlete actually resting; [mergeGapS] (150 s) is too tight to ride
+     * through those, so the bout used to shatter into many sub-bouts, most of which
+     * then fell under [minExerciseMin] and vanished. A genuine rest between two
+     * separate workouts is gated out by the HR check, not by this window.
+     */
+    const val bridgeGapS: Double = 300.0
 
     // ---- Activity series (activity.py) ----
 
@@ -167,6 +181,54 @@ object WorkoutDetector {
     /** Round to one decimal place. All inputs here are non-negative (matches Swift `.rounded()`). */
     private fun round1(v: Double): Double = (v * 10).roundToLong() / 10.0
 
+    /**
+     * Second-pass merge over raw active runs (#303).
+     *
+     * Stitch run `i+1` onto the current span when the inter-run gap (start of the
+     * next minus end of the current) is ≤ [bridgeGapS] AND HR stays elevated across
+     * that gap — i.e. the athlete kept working through a brief motion lull rather than
+     * resting. "Elevated" = the mean of the HR samples strictly inside the gap is
+     * still above [hrFloor] (resting + HR_MARGIN_BPM). If the gap carries NO HR
+     * samples it is treated as a same-effort sensor dropout and bridged; a real rest
+     * always lands HR samples in the gap (the strap streams 1 Hz), so it fails the
+     * elevation test and the two workouts stay separate. Runs must arrive sorted by
+     * start (they do — built from a sorted timeline).
+     */
+    internal fun bridgeRuns(
+        runs: List<Pair<Long, Long>>,
+        hrSeg: List<HrSample>,
+        hrFloor: Double,
+    ): List<Pair<Long, Long>> {
+        if (runs.size <= 1) return runs
+        val merged = ArrayList<Pair<Long, Long>>()
+        var curStart = runs[0].first
+        var curEnd = runs[0].second
+        for (k in 1 until runs.size) {
+            val next = runs[k]
+            val gap = (next.first - curEnd).toDouble()
+            var bridge = false
+            if (gap <= bridgeGapS) {
+                // HR samples strictly between the two runs (the lull itself).
+                val gapHR = hrSeg.filter { it.ts > curEnd && it.ts < next.first }.map { it.bpm.toDouble() }
+                bridge = if (gapHR.isEmpty()) {
+                    true // sensor dropout mid-effort → same workout
+                } else {
+                    val meanGapHR = gapHR.sum() / gapHR.size.toDouble()
+                    meanGapHR > hrFloor // still working → same workout
+                }
+            }
+            if (bridge) {
+                curEnd = maxOf(curEnd, next.second)
+            } else {
+                merged.add(curStart to curEnd)
+                curStart = next.first
+                curEnd = next.second
+            }
+        }
+        merged.add(curStart to curEnd)
+        return merged
+    }
+
     // ---- Public API ----
 
     /**
@@ -223,18 +285,23 @@ object WorkoutDetector {
         if (activeTs.isEmpty()) return emptyList()
 
         // Group contiguous active samples into runs, merging gaps < MERGE_GAP_S.
-        val runs = ArrayList<Pair<Long, Long>>()
+        val rawRuns = ArrayList<Pair<Long, Long>>()
         var runStart = activeTs[0]
         var prev = activeTs[0]
         for (k in 1 until activeTs.size) {
             val ts = activeTs[k]
             if ((ts - prev).toDouble() > mergeGapS) {
-                runs.add(runStart to prev)
+                rawRuns.add(runStart to prev)
                 runStart = ts
             }
             prev = ts
         }
-        runs.add(runStart to prev)
+        rawRuns.add(runStart to prev)
+
+        // Second pass (#303): bridge adjacent runs across a brief, still-elevated-HR
+        // lull so a sustained effort isn't shattered by coasting / junctions / sensor
+        // gaps. Runs over a genuine rest (HR falls to resting) are NOT bridged.
+        val runs = bridgeRuns(rawRuns, hrSeg, hrFloor)
 
         val minDurS = minExerciseMin * 60.0
         val sessions = ArrayList<ExerciseSession>()
@@ -331,6 +398,17 @@ object Calories {
     )
 
     const val activeHRRFraction: Double = 0.30
+
+    /**
+     * Whole-day active gate ([estimateDayCalories] only). The Keytel 2005 equation is
+     * validated for genuine EXERCISE HR; applying it to ordinary low-intensity daytime HR
+     * (walking, stairs, standing — typically ~95–110 bpm) across the WHOLE day credits the
+     * full gross-exercise rate to every elevated second and over-counts by ~1000+ kcal
+     * (community "Calories too high"). The bout path keeps the 0.30 detector fraction —
+     * Keytel is appropriate for a real detected/manual workout — but the day path raises the
+     * gate to 50% HRR so the gross rate only applies at genuine exercise-level HR.
+     */
+    const val dayActiveHRRFraction: Double = 0.50
     const val workoutDivisor: Double = 251.04 // 60 s/min × 4.184 kJ/kcal
 
     fun resolveCoeffs(sex: String): Coeffs = when (sex.lowercase()) {
@@ -353,9 +431,17 @@ object Calories {
     }
 
     /**
-     * Estimate (kcal, kJ) for a workout bout. Each HR sample = 1 second of data.
+     * Estimate (kcal, kJ) for a workout bout. Each sample is weighted by the ELAPSED time to
+     * the next sample (capped at [mergeGapS]), so a sparse, non-1 Hz stream is counted over
+     * real seconds rather than undercounted as one second per sample.
      *
-     * @param hrSamples the bout's HR samples (one second each).
+     * This elapsed-time weighting is justified ONLY for the bout path: a bout's intra-sample
+     * gaps are motion-gated and ≤ [mergeGapS] (150 s) by construction, so each gap really is
+     * continuous active/resting time. The whole-day estimator deliberately does NOT use it
+     * (see [estimateDayCalories]) — its raw, non-gap-filled day HR union would otherwise
+     * credit up to 150 s of active burn to a single isolated elevated sample.
+     *
+     * @param hrSamples the bout's HR samples (any order; sorted by ts here).
      * @param profile weight/height/age/sex for the BMR + active-EE coefficients.
      * @param hrmax effective HRmax (bpm); null → 220.
      * @param restingHR resting HR (bpm); null → 60.
@@ -377,15 +463,97 @@ object Calories {
 
         val restingRate = restingKcalPerS(coeffs, weightKg, heightCm, age)
 
+        // Weight each sample by the ACTUAL elapsed time to the next sample, not a flat 1 s.
+        // restingRate / activeKcalPerS are per-SECOND rates, so summing one per sample only
+        // equals real energy when the stream is exactly 1 Hz. A sparse WHOOP 5/MG bout can run
+        // far below 1 sample/s, which previously undercounted energy roughly in proportion to
+        // the coverage gap (calories collapsing toward ~1 kcal, #137). Each interval is capped
+        // at mergeGapS (150 s) — the detector's own "still continuous, not resting" threshold —
+        // so a brief dropout is fully counted but a wear gap can't inflate one reading. At a
+        // steady 1 Hz every interval is ~1 s: behaviour is unchanged.
+        val ordered = hrSamples.sortedBy { it.ts }
+        var totalKcal = 0.0
+        for (i in ordered.indices) {
+            val bpm = ordered[i].bpm.toDouble()
+            val dur: Double = if (i < ordered.size - 1) {
+                val gap = (ordered[i + 1].ts - ordered[i].ts).toDouble()
+                if (gap > 0) min(gap, WorkoutDetector.mergeGapS) else 1.0
+            } else {
+                1.0 // last sample carries one representative second
+            }
+            totalKcal += if (bpm < activeThreshold) {
+                restingRate * dur
+            } else {
+                activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age) * dur
+            }
+        }
+        return totalKcal to (totalKcal * 4.184)
+    }
+
+    /**
+     * APPROXIMATE whole-day total energy estimate (kcal) from the full day's HR
+     * samples. Per-second model: below the day activeThreshold (resting +
+     * [dayActiveHRRFraction] HRR) a sample burns the resting BMR rate, above it the
+     * Keytel active rate — FLOORED at the resting rate so a day-second can never be
+     * credited LESS than resting metabolism.
+     *
+     * The day path uses [dayActiveHRRFraction] (50% HRR), NOT the 30% the bout detector
+     * uses ([activeHRRFraction]). The Keytel 2005 equation is validated for genuine
+     * EXERCISE HR; at 30% the gate falls to ~94 bpm for a typical user, so ordinary
+     * low-intensity daytime HR (walking, stairs, standing) credited the full
+     * gross-exercise rate across the whole day and over-counted by ~1000+ kcal
+     * (community "Calories too high"). The 50% gate keeps the gross rate for genuine
+     * exercise-level HR only; the bout path is UNCHANGED — Keytel is appropriate there,
+     * on a real detected/manual workout.
+     *
+     * Each HR sample = ONE second of data (1 Hz strap), counted flat — this path
+     * deliberately does NOT use the bout estimator's elapsed-time-per-sample weighting.
+     * The day feed is a raw, non-gap-filled union of the day's HR (it is NOT motion-gated
+     * the way a bout is), so capping each gap at mergeGapS (150 s) would credit up to
+     * ~150 s of active burn to a single isolated elevated sample — over-counting by ~150x
+     * on gappy days. Flat one-second-per-sample is the conservative, stable choice for the
+     * day total. This is an on-device estimate from heart rate alone — NOT laboratory
+     * calorimetry, NOT Apple/WHOOP cloud parity, NOT medical advice.
+     *
+     * @param hrSamples the whole day's HR samples (one second each).
+     * @param profile weight/height/age/sex for the BMR + active-EE coefficients.
+     * @param hrmax effective HRmax (bpm); null → 220.
+     * @param restingHR resting HR (bpm); null → 60.
+     * @return total estimated kcal for the day (>= 0).
+     */
+    fun estimateDayCalories(
+        hrSamples: List<HrSample>,
+        profile: UserProfile,
+        hrmax: Double?,
+        restingHR: Double?,
+    ): Double {
+        if (hrSamples.isEmpty()) return 0.0
+
+        val weightKg = if (profile.weightKg > 0) profile.weightKg else 70.0
+        val heightCm = if (profile.heightCm > 0) profile.heightCm else 170.0
+        val age = if (profile.age > 0) profile.age else 30.0
+        val coeffs = resolveCoeffs(profile.sex)
+
+        val effHRmax = hrmax ?: 220.0
+        val effResting = restingHR ?: 60.0
+        // Day-path gate is HIGHER than the bout detector's: only genuine exercise-level HR
+        // gets the Keytel gross rate (see [dayActiveHRRFraction]).
+        val activeThreshold = effResting + dayActiveHRRFraction * (effHRmax - effResting)
+
+        val restingRate = restingKcalPerS(coeffs, weightKg, heightCm, age)
+
         var totalKcal = 0.0
         for (s in hrSamples) {
             val bpm = s.bpm.toDouble()
             totalKcal += if (bpm < activeThreshold) {
                 restingRate
             } else {
-                activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age)
+                // Floor the active rate at the resting BMR rate: a worn day-second never
+                // burns LESS than resting metabolism, even where the Keytel value dips low
+                // for some profiles just above the gate.
+                maxOf(restingRate, activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age))
             }
         }
-        return totalKcal to (totalKcal * 4.184)
+        return totalKcal
     }
 }

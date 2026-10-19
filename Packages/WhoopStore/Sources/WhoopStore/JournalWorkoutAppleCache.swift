@@ -12,9 +12,15 @@ public struct JournalEntry: Equatable, Codable {
     public let question: String
     public let answeredYes: Bool
     public let notes: String?
-    public init(day: String, question: String, answeredYes: Bool, notes: String?) {
+    /// Optional numeric reading for a numeric journal item (e.g. caffeine mg, alcohol units).
+    /// nil for a plain yes/no answer and for every imported WHOOP row (#322). A numeric log writes
+    /// answeredYes=true AND numericValue=v, so the BehaviorInsights with/without split is unchanged.
+    public let numericValue: Double?
+    public init(day: String, question: String, answeredYes: Bool, notes: String?,
+                numericValue: Double? = nil) {
         self.day = day; self.question = question
         self.answeredYes = answeredYes; self.notes = notes
+        self.numericValue = numericValue
     }
 }
 
@@ -75,15 +81,30 @@ extension WhoopStore {
             for r in rows {
                 try db.execute(sql: """
                     INSERT INTO journal
-                        (deviceId, day, question, answeredYes, notes)
-                    VALUES (?, ?, ?, ?, ?)
+                        (deviceId, day, question, answeredYes, notes, numericValue)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, day, question) DO UPDATE SET
                         answeredYes = excluded.answeredYes,
-                        notes = excluded.notes
-                    """, arguments: [deviceId, r.day, r.question, r.answeredYes ? 1 : 0, r.notes])
+                        notes = excluded.notes,
+                        numericValue = excluded.numericValue
+                    """, arguments: [deviceId, r.day, r.question, r.answeredYes ? 1 : 0, r.notes,
+                                     r.numericValue])
                 n += db.changesCount
             }
             return n
+        }
+    }
+
+    /// Delete one journal answer by natural key (the native logging card's "clear"). Source-scoped
+    /// by deviceId, so clearing a native ("noop-journal") answer never removes an identical imported
+    /// row. Returns rows deleted.
+    @discardableResult
+    public func deleteJournal(deviceId: String, day: String, question: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM journal WHERE deviceId = ? AND day = ? AND question = ?
+                """, arguments: [deviceId, day, question])
+            return db.changesCount
         }
     }
 
@@ -115,6 +136,20 @@ extension WhoopStore {
                 n += db.changesCount
             }
             return n
+        }
+    }
+
+    /// Delete one source's workouts of a given sport whose startTs is in [from, to]
+    /// (makes detected-workout re-derivation idempotent). Returns rows deleted.
+    /// Port of Android WhoopDao.deleteWorkoutsBySport (#78).
+    @discardableResult
+    public func deleteWorkouts(deviceId: String, sport: String, from: Int, to: Int) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM workout
+                WHERE deviceId = ? AND sport = ? AND startTs >= ? AND startTs <= ?
+                """, arguments: [deviceId, sport, from, to])
+            return db.changesCount
         }
     }
 
@@ -153,14 +188,15 @@ extension WhoopStore {
     public func journalEntries(deviceId: String, from: String, to: String) async throws -> [JournalEntry] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
-                SELECT day, question, answeredYes, notes FROM journal
+                SELECT day, question, answeredYes, notes, numericValue FROM journal
                 WHERE deviceId = ? AND day >= ? AND day <= ?
                 ORDER BY day ASC, question ASC
                 """, arguments: [deviceId, from, to])
                 .map {
                     JournalEntry(day: $0["day"], question: $0["question"],
                                  answeredYes: ($0["answeredYes"] as Int) != 0,
-                                 notes: $0["notes"])
+                                 notes: $0["notes"],
+                                 numericValue: $0["numericValue"])
                 }
         }
     }

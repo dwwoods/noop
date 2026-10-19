@@ -6,8 +6,8 @@ frame envelope, checksums, packet/command/event enumerations, the bond handshake
 historical-data offload state machine.
 
 NOOP is a standalone, fully offline companion. It pairs over BLE, decodes the strap's own
-streams on-device, and stores everything locally in SQLite. There is no cloud, account, or
-subscription involved in any of the exchanges described here.
+streams on-device, and stores everything locally in SQLite. There is no cloud or account
+involved in any of the exchanges described here.
 
 > **Interoperability & safety note.** This describes interoperation with the user's *own*
 > device and the data it already holds. NOOP is **not affiliated with, authorized by, or
@@ -18,9 +18,11 @@ subscription involved in any of the exchanges described here.
 
 The protocol decoder is platform-pure Swift in the `WhoopProtocol` package
 (`Packages/WhoopProtocol/`); it never imports CoreBluetooth, so it runs unchanged in tests and
-CLI tools. The CoreBluetooth transport lives in the macOS app target under `Strand/BLE/`.
+CLI tools. The CoreBluetooth transport lives under `Strand/BLE/` and is shared by both the
+macOS and iOS app targets (the platform-pure `WhoopProtocol` package above stays
+CoreBluetooth-free for tests and CLI tools).
 
-This work builds on two open-source reverse-engineering efforts:
+This work builds on two community reverse-engineering efforts:
 
 - **`johnmiddleton12/my-whoop`** — WHOOP 4.0 protocol.
 - **`b-nnett/goose`** — WHOOP 5.0 ("puffin") protocol.
@@ -40,7 +42,8 @@ event/data channels; the standard services work even before bonding.
 ### WHOOP 4.0 — service `61080001-…`
 
 Defined in `BLEManager.swift` (the on-device, authoritative UUIDs) and mirrored as plain
-strings in `DeviceFamily.swift`.
+strings in `DeviceFamily.swift`. The same `Strand/BLE/` sources (`BLEManager`,
+`StandardHeartRate`, `FrameRouter`) back both Apple-platform targets — macOS and iOS.
 
 | Role | UUID | Direction |
 |------|------|-----------|
@@ -372,6 +375,26 @@ public func frame(seq: UInt8, payload: [UInt8] = [0x00]) -> [UInt8] {
 > send `EXIT_HIGH_FREQ_SYNC` (97) defensively on connect to release a strap a previous app may
 > have parked there. Plain `SEND_HISTORICAL_DATA` returns the type-47 store without it.
 
+### Additional 5-class command numbers
+
+Command bytes present on a 5-class (MAVERICK) strap beyond the safe subset above. NOOP does not
+send these; they are recorded for completeness.
+
+| Code | Command | Purpose |
+|-----:|---------|---------|
+| 48 (0x30) | `SEND_EVENT_PACKETS` | flush stored event packets |
+| 61 (0x3D) | `SET_AFE_PARAMETERS` | set optical AFE parameters |
+| 62 (0x3E) | `GET_AFE_PARAMETERS` | read optical AFE parameters |
+
+On MAVERICK the clock commands also answer in the high opcode space — `SET_CLOCK` at 146 (0x92)
+and `GET_CLOCK` at 147 (0x93), alongside `GET_HELLO` at 145 (0x91) — distinct from the 4.0
+numbers (10 / 11) above.
+
+The strap further exposes an ECG/HeartKey command family (`ECG_MAIN_CONTROL`, `ECG_SEND_RAW`,
+`ECG_SAVE_RAW`, `ECG_SAVE_FILTERED`, `ECG_SELECT_WRIST`; five consecutive codes around 0x7B–0x8B),
+an `IMU_SET_DATA_STREAM` (code 106, shared with `TOGGLE_IMU_MODE`), and a `UART_DISABLE` (0x61–0x69).
+Exact codes for these are unconfirmed.
+
 ### Destructive commands — *do not send*
 
 These exist on the wire but are **deliberately excluded** from `WhoopCommand`. They can wipe
@@ -387,6 +410,20 @@ data, brick, or power-cycle the strap. NOOP must never send them.
 | 38 | `PROCESS_FIRMWARE_IMAGE` | firmware write |
 | 45 | `ENTER_BLE_DFU` | enters DFU bootloader |
 | 99 | `RESET_FUEL_GAUGE` | resets battery fuel gauge |
+
+**Payload forms** (decoded from the official app's command builders — recorded here only so the
+wire format is *known and avoidable*, not so it can be sent). The opcodes are shared across WHOOP 4
+(harvard) and WHOOP 5/MG (puffin): the app's unified command enum (`EnumC58479e`) uses the same
+`25`/`29`/`32` on both transports — unlike haptics, which has a maverick-specific `0x13`.
+
+- `FORCE_TRIM` (25) — body is **two little-endian int32 range args**. The app's "erase everything"
+  form sets both to `-16843010` (`0xFEFEFEFE`), an 8-byte sentinel that trims the entire stored
+  range (builder `rh0.C45484g`: `new C45484g(-16843010, -16843010)`). It is **not** an empty/`[0x00]`
+  payload. This wipes the rolling ~14-day flash history — anything not already offloaded is gone.
+- `REBOOT_STRAP` (29) — **empty body** (builder `rh0.C45476d0` passes a null payload). The strap drops
+  the BLE link and re-advertises after boot; stored data is kept. Non-destructive, but interrupts any
+  in-flight offload. 5/MG framing is not hardware-confirmed (haptics already showed 5/MG can diverge on
+  both opcode and payload), so treat the puffin form as unverified until a real wire capture exists.
 
 ---
 

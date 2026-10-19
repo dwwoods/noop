@@ -27,13 +27,13 @@ public enum StrandTone: Sendable {
 
 public struct StatePill: View {
 
-    public var title: String
+    public var title: LocalizedStringKey
     public var tone: StrandTone
     public var showsDot: Bool
     /// Pulse the leading dot (e.g. "live" / "syncing").
     public var pulsing: Bool
 
-    public init(_ title: String, tone: StrandTone = .neutral, showsDot: Bool = true, pulsing: Bool = false) {
+    public init(_ title: LocalizedStringKey, tone: StrandTone = .neutral, showsDot: Bool = true, pulsing: Bool = false) {
         self.title = title
         self.tone = tone
         self.showsDot = showsDot
@@ -76,6 +76,8 @@ public struct ConnectionDot: View {
     public var size: CGFloat
 
     @State private var animate = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var scheme
 
     public init(tone: StrandTone = .positive, pulsing: Bool = false, size: CGFloat = 9) {
         self.tone = tone
@@ -85,13 +87,19 @@ public struct ConnectionDot: View {
 
     public var body: some View {
         ZStack {
-            if pulsing {
+            // Dark-mode only (#review): AdditiveBloom used to hide this expanding ring on light
+            // (content.opacity(0)); now that we drop the offscreen bloom, gate it explicitly so light
+            // mode stays ring-free (the resting dot + its shadow carry the live state there).
+            if pulsing && scheme == .dark {
                 Circle()
                     .fill(tone.color)
                     .frame(width: size, height: size)
                     .scaleEffect(animate ? 2.4 : 1.0)
                     .opacity(animate ? 0.0 : 0.5)
-                    .blendMode(.plusLighter)
+                    // No .additiveBloom(): the .plusLighter blend forced an offscreen pass every
+                    // frame of the repeatForever pulse, a continuous cost while a strap is backfilling
+                    // (exactly when this live dot is on screen). The expanding/fading ring reads the
+                    // same without it; the resting dot's shadow still carries the "live" glow.
             }
             Circle()
                 .fill(tone.color)
@@ -99,8 +107,10 @@ public struct ConnectionDot: View {
                 .shadow(color: tone.color.opacity(0.8), radius: pulsing ? 4 : 2)
         }
         .frame(width: size, height: size)
-        .onAppear { if pulsing { animate = true } }
-        .animation(pulsing ? StrandMotion.breathe : nil, value: animate)
+        // Honour Reduce Motion: don't kick off the looping pulse (settles at the
+        // resting dot) and never attach the repeatForever breathe animation.
+        .onAppear { if pulsing && !reduceMotion { animate = true } }
+        .animation(pulsing && !reduceMotion ? StrandMotion.breathe : nil, value: animate)
         .accessibilityHidden(true)
     }
 }
