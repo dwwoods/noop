@@ -265,6 +265,9 @@ interface GattOps {
     fun requestMtuCompat(mtu: Int): Boolean
     fun readRemoteRssiCompat(): Boolean
     fun discoverServicesCompat(): Boolean
+    /** BluetoothGatt.requestConnectionPriority. Not a GATT op (no callback, no op slot), so it never
+     *  blocks the command queue. Default false so test fakes needn't implement it. */
+    fun requestConnectionPriorityCompat(priority: Int): Boolean = false
 }
 
 /**
@@ -315,6 +318,8 @@ class RealGattOps(private val gatt: BluetoothGatt) : GattOps {
     override fun requestMtuCompat(mtu: Int): Boolean = gatt.requestMtu(mtu)
     override fun readRemoteRssiCompat(): Boolean = gatt.readRemoteRssi()
     override fun discoverServicesCompat(): Boolean = gatt.discoverServices()
+    override fun requestConnectionPriorityCompat(priority: Int): Boolean =
+        gatt.requestConnectionPriority(priority)
 }
 
 class WhoopBleClient(
@@ -600,17 +605,10 @@ class WhoopBleClient(
 
         // MARK: Live-stream keep-alive (port of BLEManager.keepAlive*). The WHOOP firmware lets the
         // realtime HR stream lapse if it isn't re-armed, so a stuck-on-stale HR that only a manual
-        // disconnect/reconnect fixes is really a missing keep-alive. We re-arm + poll battery every
-        // 30s, and bounce a truly silent link after 120s (the auto version of disconnect+reconnect).
+        // disconnect/reconnect fixes is really a missing keep-alive. Every 30s we re-arm, poll battery and
+        // bounce a truly silent link. The fuses and poll cadence live in [LinkPowerPolicy]: tight while a
+        // live HR consumer wants the stream, relaxed when idle so the held link stays cheap for the strap.
         private const val KEEPALIVE_INTERVAL_MS = 30_000L
-        /** No inbound data for this long ⇒ the link/stream stalled; bounce it to resume streaming. */
-        private const val KEEPALIVE_STALL_MS = 120_000L
-        /** #580: longer stall fuse for a known history-empty 5/MG. Live HR over 0x2A37 keeps the link alive
-         *  but can lull >120s (off-wrist / resting) while the empty offload leaves the data channel quiet,
-         *  so the tight 120s rule bounced a healthy link every ~2 min. 10 min stops the thrash. */
-        private const val KEEPALIVE_STALL_5MG_EMPTY_MS = 600_000L
-        /** Stream gone quiet this long (but not yet stall) ⇒ re-subscribe in case a CCCD silently dropped. */
-        private const val KEEPALIVE_QUIET_MS = 45_000L
 
         /** A CCCD write can transiently return BUSY if the stack slot hasn't freed yet; retry the same
          *  subscribe a few times (short backoff) before giving up, rather than dropping the stream. */
@@ -1479,6 +1477,9 @@ class WhoopBleClient(
     /** What we last told the strap (armed = TOGGLE_REALTIME_HR 1). Lets [reconcileRealtime] send the
      *  toggle only on the false↔true edge instead of on every input change. */
     @Volatile private var realtimeArmed = false
+    /** Last connection priority we asked the stack for, so [applyLinkPriority] only sends on a change.
+     *  Null after [reset]: a fresh link starts at the stack default (BALANCED). */
+    private var appliedLinkPriority: LinkPowerPolicy.Priority? = null
     /** Wall-clock of the last inbound notification — drives the keep-alive liveness watchdog. */
     @Volatile private var lastDataAtMs = 0L
     /** True once we've re-subscribed during the CURRENT quiet episode, so the keep-alive re-subscribes
@@ -3731,9 +3732,14 @@ class WhoopBleClient(
             // over the standard 0x2A37 profile keeps the link genuinely alive, but its packets can lull for
             // >120s when the strap is off-wrist / resting, and an empty offload leaves the data channel
             // quiet — so the old 120s rule disconnected/rescanned a perfectly healthy link every ~2 min (the
-            // thrash this fixes). A WHOOP 4 (real "not recording" path) keeps the tight 120s fuse.
-            val bounceFuse = if (connectedFamily == DeviceFamily.WHOOP5 && whoop5EmptyOffload.historyEmpty)
-                KEEPALIVE_STALL_5MG_EMPTY_MS else KEEPALIVE_STALL_MS
+            // thrash this fixes). A WHOOP 4 (real "not recording" path) keeps the tight 120s fuse while live.
+            // Strap battery: with no live consumer a quiet link is normal (nothing is streaming), so the
+            // idle fuse outlasts the slow battery poll and the 15 min offload instead of rebuilding a
+            // healthy link every 2 min. See LinkPowerPolicy.
+            val bounceFuse = LinkPowerPolicy.bounceFuseMs(
+                wantsRealtime = wantsRealtime,
+                whoop5HistoryEmpty = connectedFamily == DeviceFamily.WHOOP5 && whoop5EmptyOffload.historyEmpty,
+            )
             if (silentMs > bounceFuse) {
                 // Nothing for the fuse window — the live stream/link stalled. Bounce it: the auto-rescan on
                 // disconnect re-bonds and resumes streaming (the automatic version of the manual fix).
@@ -3752,7 +3758,9 @@ class WhoopBleClient(
                 // but only ONCE per quiet episode. Re-subscribing all notify chars every 30s tick floods
                 // descriptor writes that collide with the command queue on a slow stack (#77); a single
                 // re-subscribe recovers a dropped CCCD, repeating it just adds congestion. Re-armed on data.
-                if (silentMs > KEEPALIVE_QUIET_MS && !resubscribedSinceData) {
+                // Live consumers only: idle, silence between battery polls is expected, and re-writing
+                // every CCCD each minute just wakes the strap radio.
+                if (LinkPowerPolicy.shouldResubscribe(silentMs, resubscribedSinceData, wantsRealtime)) {
                     resubscribedSinceData = true
                     enableLiveNotifications()
                 }
@@ -3776,7 +3784,10 @@ class WhoopBleClient(
                 if (connectedFamily == DeviceFamily.WHOOP4) {
                     if (wantsRealtime) { realtimeArmed = true; send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1)) }
                     keepAliveTick += 1
-                    if (keepAliveTick % 2 == 0) send(CommandNumber.GET_BATTERY_LEVEL)
+                    // ~60s while live, ~10 min idle (strap battery; a charge level moves slowly).
+                    if (keepAliveTick % LinkPowerPolicy.batteryPollEveryTicks(wantsRealtime) == 0) {
+                        send(CommandNumber.GET_BATTERY_LEVEL)
+                    }
                 }
             }
         }
@@ -3885,6 +3896,29 @@ class WhoopBleClient(
         // Both families arm/disarm via TOGGLE_REALTIME_HR; send() frames it correctly per family (puffin
         // for 5/MG). A screen re-entry blanks its own smoothing window in the view-model, not here.
         send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(if (want) 1.toByte() else 0.toByte()))
+        applyLinkPriority("realtime ${if (want) "on" else "off"}")
+    }
+
+    /**
+     * Ask the stack for the connection interval [LinkPowerPolicy] wants now: HIGH while an offload runs,
+     * BALANCED while live HR is wanted, LOW_POWER otherwise. The interval is the main cost of a held
+     * link on the strap's battery, so an idle link must not sit at the stack's BALANCED default.
+     * Only sends on a change; main-looper only (every caller is).
+     */
+    private fun applyLinkPriority(reason: String) {
+        val s = _state.value
+        if (!s.connected || !s.bonded) return
+        val want = LinkPowerPolicy.priority(backfilling, wantsRealtime)
+        if (want == appliedLinkPriority) return
+        val ops = gattOps ?: return
+        val android = when (want) {
+            LinkPowerPolicy.Priority.HIGH -> BluetoothGatt.CONNECTION_PRIORITY_HIGH
+            LinkPowerPolicy.Priority.BALANCED -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+            LinkPowerPolicy.Priority.LOW_POWER -> BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+        }
+        val ok = safeGatt("requestConnectionPriority") { ops.requestConnectionPriorityCompat(android) }
+        if (ok) appliedLinkPriority = want
+        log("Link priority -> $want ($reason)${if (ok) "" else " rejected by stack"}")
     }
 
     /**
@@ -4341,6 +4375,7 @@ class WhoopBleClient(
         offloadFramesThisSession = 0
         historicalKickSent = false
         _state.update { it.copy(backfilling = true, syncChunksThisSession = 0) }
+        applyLinkPriority("offload start")   // fast interval: the transfer ends sooner, radio sleeps longer
         // Opt-in raw capture (research aid): pref read fresh per session, like the probes gate.
         if (connectedFamily == DeviceFamily.WHOOP5 && PuffinExperiment.from(context).isCaptureEnabled) {
             startWhoop5BackfillCapture()
@@ -4573,6 +4608,7 @@ class WhoopBleClient(
         } }
         handler.removeCallbacks(backfillTimeoutRunnable)
         backfillFrameQueue.clear()
+        applyLinkPriority("offload end")
         closeWhoop5BackfillCapture(flushSummary = true)
         log("Backfill: session ended — reason=$reason")
         // Inactivity reminder (#419): read-only hook on the natural offload completion (no cadence
@@ -5042,6 +5078,7 @@ class WhoopBleClient(
         // ([screenWantsRealtime]/[keepStreamForData]/[wantsRealtime]) are intent and must survive a
         // reconnect so the stream comes back automatically.
         realtimeArmed = false
+        appliedLinkPriority = null
 
         // Reset offload state so the next connect starts a fresh session (port of the backfill
         // flag resets in didDisconnectPeripheral). Timers are handler-posted, so cancel them here.
